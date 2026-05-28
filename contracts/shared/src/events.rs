@@ -55,3 +55,7 @@ pub fn protocol_paused(env: &Env, by: &Address) {
 pub fn protocol_unpaused(env: &Env, by: &Address) {
     emit(env, symbol_short!("UNPAUSED"), by.clone());
 }
+
+pub fn fee_withdrawn(env: &Env, token: &Address, amount: i128) {
+    emit(env, symbol_short!("FEE_WTH"), (token.clone(), amount));
+}

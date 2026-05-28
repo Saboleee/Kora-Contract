@@ -62,6 +62,7 @@ impl TreasuryContract {
         }
 
         token_client.transfer(&env.current_contract_address(), &recipient, &amount);
+        events::fee_withdrawn(&env, &token, amount);
         Ok(())
     }
 
@@ -113,19 +114,148 @@ mod tests {
     use super::*;
     use soroban_sdk::{testutils::Address as _, Env};
 
-    #[test]
-    fn test_initialize_and_fee() {
+    fn setup() -> (Env, Address, TreasuryContractClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, TreasuryContract);
         let client = TreasuryContractClient::new(&env, &contract_id);
-
         let admin = Address::generate(&env);
         client.initialize(&admin, &50u32);
-        assert_eq!(client.get_fee_bps(), 50);
+        (env, admin, client)
+    }
 
+    #[test]
+    fn test_initialize_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, TreasuryContract);
+        let client = TreasuryContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        
+        client.initialize(&admin, &50u32);
+        assert_eq!(client.get_fee_bps(), 50);
+    }
+
+    #[test]
+    fn test_initialize_already_initialized_fails() {
+        let (env, admin, client) = setup();
+        let result = client.try_initialize(&admin, &50u32);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_initialize_invalid_fee_bps_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, TreasuryContract);
+        let client = TreasuryContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        
+        let result = client.try_initialize(&admin, &10_001u32);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_fee_bps_success() {
+        let (env, admin, client) = setup();
+        assert_eq!(client.get_fee_bps(), 50);
+        
         client.set_fee_bps(&admin, &100u32);
         assert_eq!(client.get_fee_bps(), 100);
+    }
+
+    #[test]
+    fn test_set_fee_bps_requires_admin() {
+        let (env, admin, client) = setup();
+        let non_admin = Address::generate(&env);
+        
+        let result = client.try_set_fee_bps(&non_admin, &100u32);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_fee_bps_invalid_bps_fails() {
+        let (env, admin, client) = setup();
+        
+        let result = client.try_set_fee_bps(&admin, &10_001u32);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_fee_bps_zero_succeeds() {
+        let (env, admin, client) = setup();
+        
+        client.set_fee_bps(&admin, &0u32);
+        assert_eq!(client.get_fee_bps(), 0);
+    }
+
+    #[test]
+    fn test_set_fee_bps_max_succeeds() {
+        let (env, admin, client) = setup();
+        
+        client.set_fee_bps(&admin, &10_000u32);
+        assert_eq!(client.get_fee_bps(), 10_000);
+    }
+
+    #[test]
+    fn test_withdraw_requires_admin() {
+        let (env, admin, client) = setup();
+        let non_admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        
+        let result = client.try_withdraw(&non_admin, &token, &recipient, &1_000_000i128);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_withdraw_zero_amount_fails() {
+        let (env, admin, client) = setup();
+        let token = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        
+        let result = client.try_withdraw(&admin, &token, &recipient, &0i128);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_withdraw_negative_amount_fails() {
+        let (env, admin, client) = setup();
+        let token = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        
+        let result = client.try_withdraw(&admin, &token, &recipient, &-1_000_000i128);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_emergency_withdraw_requires_admin() {
+        let (env, admin, client) = setup();
+        let non_admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        
+        let result = client.try_emergency_withdraw(&non_admin, &token, &recipient);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_fee_bps_default() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, TreasuryContract);
+        let client = TreasuryContractClient::new(&env, &contract_id);
+        
+        assert_eq!(client.get_fee_bps(), 50);
+    }
+
+    #[test]
+    fn test_get_balance_zero_initially() {
+        let (env, admin, client) = setup();
+        let token = Address::generate(&env);
+        
+        let balance = client.get_balance(&token);
+        assert_eq!(balance, 0);
     }
 
     #[test]
