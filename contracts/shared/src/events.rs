@@ -4,6 +4,8 @@ fn emit(env: &Env, name: Symbol, data: impl soroban_sdk::IntoVal<Env, soroban_sd
     env.events().publish((name,), data);
 }
 
+// ── Invoice Events ──────────────────────────────────────────────────────────
+
 pub fn invoice_created(env: &Env, invoice_id: u64, sme: &Address, amount: i128) {
     emit(env, symbol_short!("INV_CRT"), (invoice_id, sme.clone(), amount));
 }
@@ -16,6 +18,16 @@ pub fn invoice_funded(env: &Env, invoice_id: u64, investor: &Address, amount: i1
     emit(env, symbol_short!("INV_FND"), (invoice_id, investor.clone(), amount));
 }
 
+pub fn invoice_repaid(env: &Env, invoice_id: u64, sme: &Address, amount: i128) {
+    emit(env, symbol_short!("INV_RPD"), (invoice_id, sme.clone(), amount));
+}
+
+pub fn invoice_defaulted(env: &Env, invoice_id: u64, sme: &Address) {
+    emit(env, symbol_short!("INV_DFT"), (invoice_id, sme.clone()));
+}
+
+// ── Repayment Events ────────────────────────────────────────────────────────
+
 pub fn repayment_made(env: &Env, invoice_id: u64, payer: &Address, amount: i128) {
     emit(env, symbol_short!("REPAY"), (invoice_id, payer.clone(), amount));
 }
@@ -24,9 +36,7 @@ pub fn yield_distributed(env: &Env, invoice_id: u64, investor: &Address, yield_a
     emit(env, symbol_short!("YIELD"), (invoice_id, investor.clone(), yield_amount));
 }
 
-pub fn invoice_defaulted(env: &Env, invoice_id: u64, sme: &Address) {
-    emit(env, symbol_short!("DEFAULT"), (invoice_id, sme.clone()));
-}
+// ── Marketplace Events ──────────────────────────────────────────────────────
 
 pub fn listing_cancelled(env: &Env, invoice_id: u64, seller: &Address) {
     emit(env, symbol_short!("LST_CXL"), (invoice_id, seller.clone()));
@@ -35,6 +45,8 @@ pub fn listing_cancelled(env: &Env, invoice_id: u64, seller: &Address) {
 pub fn fee_collected(env: &Env, invoice_id: u64, fee_amount: i128, token: &Address) {
     emit(env, symbol_short!("FEE_COL"), (invoice_id, fee_amount, token.clone()));
 }
+
+// ── Protocol Events ────────────────────────────────────────────────────────
 
 pub fn protocol_paused(env: &Env, by: &Address) {
     emit(env, symbol_short!("PAUSED"), by.clone());

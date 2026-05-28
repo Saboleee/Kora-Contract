@@ -21,6 +21,7 @@ pub enum DataKey {
     NextId,
     Admin,
     AccessControl,
+    InvoiceCount,
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -61,6 +62,11 @@ impl InvoiceNftContract {
         require_non_empty_bytes(&debtor_hash)?;
         require_non_empty_string(&ipfs_cid)?;
 
+        // Ensure amount doesn't exceed safe bounds
+        if amount > i128::MAX / 2 {
+            return Err(KoraError::ArithmeticOverflow);
+        }
+
         let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
 
         let invoice = Invoice {
@@ -80,7 +86,11 @@ impl InvoiceNftContract {
         };
 
         env.storage().persistent().set(&DataKey::Invoice(id), &invoice);
-        env.storage().instance().set(&DataKey::NextId, &(id + 1));
+        env.storage().instance().set(&DataKey::NextId, &(id.checked_add(1).ok_or(KoraError::ArithmeticOverflow)?));
+
+        // Increment invoice count for metrics
+        let count: u64 = env.storage().instance().get(&DataKey::InvoiceCount).unwrap_or(0);
+        env.storage().instance().set(&DataKey::InvoiceCount, &(count.checked_add(1).ok_or(KoraError::ArithmeticOverflow)?));
 
         events::invoice_created(&env, id, &sme, amount);
         Ok(id)
@@ -124,6 +134,7 @@ impl InvoiceNftContract {
         invoice.status = InvoiceStatus::Repaid;
         invoice.repaid_at = Some(env.ledger().timestamp());
         env.storage().persistent().set(&DataKey::Invoice(invoice_id), &invoice);
+        events::invoice_repaid(&env, invoice_id, &invoice.sme, invoice.amount);
         Ok(())
     }
 
@@ -153,6 +164,10 @@ impl InvoiceNftContract {
 
     pub fn next_id(env: Env) -> u64 {
         env.storage().instance().get(&DataKey::NextId).unwrap_or(1)
+    }
+
+    pub fn invoice_count(env: Env) -> u64 {
+        env.storage().instance().get(&DataKey::InvoiceCount).unwrap_or(0)
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────

@@ -20,6 +20,7 @@ pub enum DataKey {
     InvoiceNft,
     Treasury,
     LatePenaltyBps,
+    RepaymentLock(u64), // Reentrancy guard: tracks if repayment is in progress
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -161,24 +162,29 @@ impl FinancingPoolContract {
             return Err(KoraError::RepaymentAlreadyMade);
         }
 
-        let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&payer, &env.current_contract_address(), &amount);
+        // Validate amount
+        if amount <= 0 {
+            return Err(KoraError::InvalidAmount);
+        }
+
+        let token_client = token::Client::new(env, token);
+        token_client.transfer(payer, &env.current_contract_address(), &amount);
 
         pool.repaid_amount = pool
             .repaid_amount
             .checked_add(amount)
             .ok_or(KoraError::ArithmeticOverflow)?;
 
-        events::repayment_made(&env, invoice_id, &payer, amount);
+        events::repayment_made(env, invoice_id, payer, amount);
 
         if pool.repaid_amount >= pool.face_value {
             pool.is_closed = true;
             env.storage().persistent().set(&DataKey::Pool(invoice_id), &pool);
-            Self::distribute_yield(&env, invoice_id, &token, pool.repaid_amount, pool.face_value)?;
+            Self::distribute_yield(env, invoice_id, token, pool.repaid_amount, pool.face_value)?;
 
             // Mark NFT as repaid
             let nft_contract: Address = env.storage().instance().get(&DataKey::InvoiceNft).unwrap();
-            let nft_client = kora_invoice_nft::InvoiceNftContractClient::new(&env, &nft_contract);
+            let nft_client = kora_invoice_nft::InvoiceNftContractClient::new(env, &nft_contract);
             nft_client.set_repaid(&env.current_contract_address(), &invoice_id);
         } else {
             env.storage().persistent().set(&DataKey::Pool(invoice_id), &pool);
@@ -227,6 +233,11 @@ impl FinancingPoolContract {
     ) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+
+        // Check reentrancy guard
+        if env.storage().persistent().has(&DataKey::RepaymentLock(invoice_id)) {
+            return Err(KoraError::ProtocolPaused);
+        }
 
         let pool: Pool = env
             .storage()

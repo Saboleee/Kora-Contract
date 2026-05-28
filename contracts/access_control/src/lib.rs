@@ -181,4 +181,51 @@ mod tests {
         let result = client.try_pause(&stranger);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_non_admin_cannot_grant_role() {
+        let (env, _admin, client) = setup();
+        let stranger = Address::generate(&env);
+        let target = Address::generate(&env);
+        let result = client.try_grant_role(&stranger, &target, &Role::Verifier);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_non_admin_cannot_transfer_admin() {
+        let (env, _admin, client) = setup();
+        let stranger = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+        let result = client.try_transfer_admin(&stranger, &new_admin);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_multiple_role_assignments() {
+        let (env, admin, client) = setup();
+        let verifier1 = Address::generate(&env);
+        let verifier2 = Address::generate(&env);
+        let operator = Address::generate(&env);
+
+        client.grant_role(&admin, &verifier1, &Role::Verifier);
+        client.grant_role(&admin, &verifier2, &Role::Verifier);
+        client.grant_role(&admin, &operator, &Role::Operator);
+
+        assert_eq!(client.get_role(&verifier1), Role::Verifier);
+        assert_eq!(client.get_role(&verifier2), Role::Verifier);
+        assert_eq!(client.get_role(&operator), Role::Operator);
+    }
+
+    #[test]
+    fn test_role_override() {
+        let (env, admin, client) = setup();
+        let user = Address::generate(&env);
+
+        client.grant_role(&admin, &user, &Role::Operator);
+        assert_eq!(client.get_role(&user), Role::Operator);
+
+        // Override with different role
+        client.grant_role(&admin, &user, &Role::Verifier);
+        assert_eq!(client.get_role(&user), Role::Verifier);
+    }
 }
