@@ -3,3 +3,4 @@ target/
 *.wasm
 .env
 .env.*
+**/test_snapshots/
