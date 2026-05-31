@@ -61,11 +61,6 @@ impl InvoiceNftContract {
         require_non_empty_bytes(&debtor_hash)?;
         require_non_empty_string(&ipfs_cid)?;
 
-        // Ensure amount doesn't exceed safe bounds
-        if amount > i128::MAX / 2 {
-            return Err(KoraError::ArithmeticOverflow);
-        }
-
         let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
 
         let invoice = Invoice {
@@ -84,8 +79,13 @@ impl InvoiceNftContract {
             repaid_at: None,
         };
 
-        env.storage().persistent().set(&DataKey::Invoice(id), &invoice);
-        env.storage().instance().set(&DataKey::NextId, &(id.checked_add(1).ok_or(KoraError::ArithmeticOverflow)?));
+        env.storage()
+            .persistent()
+            .set(&DataKey::Invoice(id), &invoice);
+        env.storage().instance().set(
+            &DataKey::NextId,
+            &(id.checked_add(1).ok_or(KoraError::ArithmeticOverflow)?),
+        );
 
         events::invoice_created(&env, id, &sme, amount);
         Ok(id)
@@ -132,7 +132,9 @@ impl InvoiceNftContract {
         }
         invoice.status = InvoiceStatus::Repaid;
         invoice.repaid_at = Some(env.ledger().timestamp());
-        env.storage().persistent().set(&DataKey::Invoice(invoice_id), &invoice);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Invoice(invoice_id), &invoice);
         events::invoice_repaid(&env, invoice_id, &invoice.sme, invoice.amount);
         Ok(())
     }
@@ -247,7 +249,7 @@ mod tests {
         let client = InvoiceNftContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let access_control = Address::generate(&env);
-        
+
         client.initialize(&admin, &access_control);
         assert_eq!(client.next_id(), 1);
     }
@@ -256,7 +258,7 @@ mod tests {
     fn test_initialize_already_initialized_fails() {
         let (env, admin, client) = setup();
         let access_control = Address::generate(&env);
-        
+
         let result = client.try_initialize(&admin, &access_control);
         assert!(result.is_err());
     }
@@ -430,18 +432,31 @@ mod tests {
         let (env, _admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+        let ipfs_cid = String::from_str(
+            &env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
         let due_date = env.ledger().timestamp() + 86_400 * 30;
 
         let id1 = client.mint_invoice(
-            &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &sme,
+            &debtor_hash,
+            &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"),
+            &due_date,
+            &ipfs_cid,
+            &10u32,
         );
         let id2 = client.mint_invoice(
-            &sme, &debtor_hash, &2_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &20u32,
+            &sme,
+            &debtor_hash,
+            &2_000_000_000i128,
+            &Symbol::new(&env, "USDC"),
+            &due_date,
+            &ipfs_cid,
+            &20u32,
         );
-        
+
         assert_eq!(id1, 1);
         assert_eq!(id2, 2);
         assert_eq!(client.next_id(), 3);
@@ -452,7 +467,10 @@ mod tests {
         let (env, _admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+        let ipfs_cid = String::from_str(
+            &env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
         let due_date = env.ledger().timestamp() + 86_400 * 30;
 
         let test_cases = vec![
@@ -470,8 +488,13 @@ mod tests {
 
         for (score, expected_tier) in test_cases {
             let id = client.mint_invoice(
-                &sme, &debtor_hash, &1_000_000_000i128,
-                &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &score,
+                &sme,
+                &debtor_hash,
+                &1_000_000_000i128,
+                &Symbol::new(&env, "USDC"),
+                &due_date,
+                &ipfs_cid,
+                &score,
             );
             let invoice = client.get_invoice(&id);
             assert_eq!(invoice.risk_tier, expected_tier);
@@ -516,12 +539,20 @@ mod tests {
         let (env, _admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+        let ipfs_cid = String::from_str(
+            &env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
         let due_date = env.ledger().timestamp() + 86_400 * 30;
 
         let id = client.mint_invoice(
-            &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &sme,
+            &debtor_hash,
+            &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"),
+            &due_date,
+            &ipfs_cid,
+            &10u32,
         );
 
         let pool = Address::generate(&env);
@@ -534,12 +565,20 @@ mod tests {
         let (env, _admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+        let ipfs_cid = String::from_str(
+            &env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
         let due_date = env.ledger().timestamp() + 86_400 * 30;
 
         let id = client.mint_invoice(
-            &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &sme,
+            &debtor_hash,
+            &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"),
+            &due_date,
+            &ipfs_cid,
+            &10u32,
         );
 
         let marketplace = Address::generate(&env);
@@ -555,12 +594,20 @@ mod tests {
         let (env, admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+        let ipfs_cid = String::from_str(
+            &env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
         let due_date = env.ledger().timestamp() + 86_400 * 30;
 
         let id = client.mint_invoice(
-            &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &sme,
+            &debtor_hash,
+            &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"),
+            &due_date,
+            &ipfs_cid,
+            &10u32,
         );
 
         let marketplace = Address::generate(&env);
@@ -578,12 +625,20 @@ mod tests {
         let (env, admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+        let ipfs_cid = String::from_str(
+            &env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
         let due_date = env.ledger().timestamp() + 86_400;
 
         let id = client.mint_invoice(
-            &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &sme,
+            &debtor_hash,
+            &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"),
+            &due_date,
+            &ipfs_cid,
+            &10u32,
         );
 
         let marketplace = Address::generate(&env);
@@ -614,13 +669,21 @@ mod tests {
         let (env, _admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+        let ipfs_cid = String::from_str(
+            &env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
         let due_date = env.ledger().timestamp() + 86_400 * 30;
         let created_at = env.ledger().timestamp();
 
         let id = client.mint_invoice(
-            &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &sme,
+            &debtor_hash,
+            &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"),
+            &due_date,
+            &ipfs_cid,
+            &10u32,
         );
 
         let invoice = client.get_invoice(&id);
@@ -646,13 +709,21 @@ mod tests {
         let (env, _admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+        let ipfs_cid = String::from_str(
+            &env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
         let due_date = env.ledger().timestamp() + 86_400 * 30;
 
         let large_amount = 9_223_372_036_854_775_807i128; // i128::MAX
         let id = client.mint_invoice(
-            &sme, &debtor_hash, &large_amount,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &50u32,
+            &sme,
+            &debtor_hash,
+            &large_amount,
+            &Symbol::new(&env, "USDC"),
+            &due_date,
+            &ipfs_cid,
+            &50u32,
         );
 
         let invoice = client.get_invoice(&id);
@@ -664,17 +735,30 @@ mod tests {
         let (env, _admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+        let ipfs_cid = String::from_str(
+            &env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
         let due_date = env.ledger().timestamp() + 86_400 * 30;
 
         let id1 = client.mint_invoice(
-            &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &sme,
+            &debtor_hash,
+            &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"),
+            &due_date,
+            &ipfs_cid,
+            &10u32,
         );
 
         let id2 = client.mint_invoice(
-            &sme, &debtor_hash, &2_000_000_000i128,
-            &Symbol::new(&env, "EURC"), &due_date, &ipfs_cid, &20u32,
+            &sme,
+            &debtor_hash,
+            &2_000_000_000i128,
+            &Symbol::new(&env, "EURC"),
+            &due_date,
+            &ipfs_cid,
+            &20u32,
         );
 
         let invoice1 = client.get_invoice(&id1);
@@ -689,12 +773,20 @@ mod tests {
         let (env, _admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+        let ipfs_cid = String::from_str(
+            &env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
         let due_date = env.ledger().timestamp() + 86_400 * 30;
 
         let id = client.mint_invoice(
-            &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &sme,
+            &debtor_hash,
+            &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"),
+            &due_date,
+            &ipfs_cid,
+            &10u32,
         );
 
         let invoice1 = client.get_invoice(&id);
@@ -710,12 +802,20 @@ mod tests {
         let (env, _admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+        let ipfs_cid = String::from_str(
+            &env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
         let due_date = env.ledger().timestamp() + 86_400 * 30;
 
         let id = client.mint_invoice(
-            &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &sme,
+            &debtor_hash,
+            &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"),
+            &due_date,
+            &ipfs_cid,
+            &10u32,
         );
 
         let marketplace = Address::generate(&env);
@@ -730,12 +830,20 @@ mod tests {
         let (env, _admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+        let ipfs_cid = String::from_str(
+            &env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
         let due_date = env.ledger().timestamp() + 86_400 * 30;
 
         let id = client.mint_invoice(
-            &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &sme,
+            &debtor_hash,
+            &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"),
+            &due_date,
+            &ipfs_cid,
+            &10u32,
         );
 
         let marketplace = Address::generate(&env);
@@ -753,12 +861,20 @@ mod tests {
         let (env, _admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+        let ipfs_cid = String::from_str(
+            &env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
         let due_date = env.ledger().timestamp() + 86_400 * 30;
 
         let id = client.mint_invoice(
-            &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &sme,
+            &debtor_hash,
+            &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"),
+            &due_date,
+            &ipfs_cid,
+            &10u32,
         );
 
         let marketplace = Address::generate(&env);
@@ -777,12 +893,20 @@ mod tests {
         let (env, admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+        let ipfs_cid = String::from_str(
+            &env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
         let due_date = env.ledger().timestamp() + 86_400;
 
         let id = client.mint_invoice(
-            &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &sme,
+            &debtor_hash,
+            &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"),
+            &due_date,
+            &ipfs_cid,
+            &10u32,
         );
 
         let marketplace = Address::generate(&env);
@@ -801,19 +925,32 @@ mod tests {
         let (env, _admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+        let ipfs_cid = String::from_str(
+            &env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
         let due_date = env.ledger().timestamp() + 86_400 * 30;
 
         // Test boundary: 20 (AAA) vs 21 (AA)
         let id1 = client.mint_invoice(
-            &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &20u32,
+            &sme,
+            &debtor_hash,
+            &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"),
+            &due_date,
+            &ipfs_cid,
+            &20u32,
         );
         assert_eq!(client.get_invoice(&id1).risk_tier, RiskTier::AAA);
 
         let id2 = client.mint_invoice(
-            &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &21u32,
+            &sme,
+            &debtor_hash,
+            &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"),
+            &due_date,
+            &ipfs_cid,
+            &21u32,
         );
         assert_eq!(client.get_invoice(&id2).risk_tier, RiskTier::AA);
     }
