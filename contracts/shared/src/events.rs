@@ -1,4 +1,4 @@
-use soroban_sdk::{symbol_short, Address, Env, Symbol};
+use soroban_sdk::{symbol_short, Address, Bytes, Env, Symbol};
 
 fn emit(env: &Env, name: Symbol, data: impl soroban_sdk::IntoVal<Env, soroban_sdk::Val>) {
     env.events().publish((name,), data);
@@ -106,26 +106,73 @@ pub fn role_revoked(env: &Env, admin: &Address, target: &Address) {
 
 // ── Risk Registry Events ──────────────────────────────────────────────────────
 
+/// Emitted when the admin whitelists a new verifier.
+/// Payload: (admin, verifier, timestamp)
 pub fn verifier_added(env: &Env, admin: &Address, verifier: &Address) {
-    emit(env, symbol_short!("VRF_ADD"), (admin.clone(), verifier.clone()));
+    emit(
+        env,
+        symbol_short!("VRF_ADD"),
+        (admin.clone(), verifier.clone(), env.ledger().timestamp()),
+    );
 }
 
+/// Emitted when the admin removes a verifier.
+/// Payload: (admin, verifier, timestamp)
 pub fn verifier_removed(env: &Env, admin: &Address, verifier: &Address) {
-    emit(env, symbol_short!("VRF_REM"), (admin.clone(), verifier.clone()));
+    emit(
+        env,
+        symbol_short!("VRF_REM"),
+        (admin.clone(), verifier.clone(), env.ledger().timestamp()),
+    );
 }
 
+/// Emitted when a verifier registers a new SME profile.
+/// Payload: (verifier, sme, risk_score, timestamp)
 pub fn sme_registered(env: &Env, verifier: &Address, sme: &Address, risk_score: u32) {
-    emit(env, symbol_short!("SME_REG"), (verifier.clone(), sme.clone(), risk_score));
+    emit(
+        env,
+        symbol_short!("SME_REG"),
+        (verifier.clone(), sme.clone(), risk_score, env.ledger().timestamp()),
+    );
 }
 
+/// Emitted when a verifier updates an SME's risk score.
+/// Payload: (verifier, sme, new_score, timestamp)
 pub fn sme_score_updated(env: &Env, verifier: &Address, sme: &Address, new_score: u32) {
-    emit(env, symbol_short!("SME_UPD"), (verifier.clone(), sme.clone(), new_score));
+    emit(
+        env,
+        symbol_short!("SME_UPD"),
+        (verifier.clone(), sme.clone(), new_score, env.ledger().timestamp()),
+    );
 }
 
+/// Emitted when the admin records a default against an SME.
+/// Payload: (admin, sme, total_defaults, timestamp)
 pub fn sme_default_recorded(env: &Env, admin: &Address, sme: &Address, total_defaults: u32) {
-    emit(env, symbol_short!("SME_DFT"), (admin.clone(), sme.clone(), total_defaults));
+    emit(
+        env,
+        symbol_short!("SME_DFT"),
+        (admin.clone(), sme.clone(), total_defaults, env.ledger().timestamp()),
+    );
 }
 
-pub fn debtor_score_set(env: &Env, verifier: &Address, score: u32) {
-    emit(env, symbol_short!("DBT_SCR"), (verifier.clone(), score));
+/// Emitted when the invoice_nft contract increments an SME's invoice count.
+/// Payload: (sme, new_total_invoices, timestamp)
+pub fn sme_invoice_count_incremented(env: &Env, sme: &Address, new_total: u32) {
+    emit(
+        env,
+        symbol_short!("SME_INV"),
+        (sme.clone(), new_total, env.ledger().timestamp()),
+    );
+}
+
+/// Emitted when a verifier sets or updates a debtor risk score.
+/// Includes the debtor_hash so indexers can correlate the score to the debtor.
+/// Payload: (verifier, debtor_hash, score, timestamp)
+pub fn debtor_score_set(env: &Env, verifier: &Address, debtor_hash: &Bytes, score: u32) {
+    emit(
+        env,
+        symbol_short!("DBT_SCR"),
+        (verifier.clone(), debtor_hash.clone(), score, env.ledger().timestamp()),
+    );
 }
