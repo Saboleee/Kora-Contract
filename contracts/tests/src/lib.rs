@@ -69,7 +69,7 @@ mod integration {
         mp.initialize(&admin, &nft_id, &pool_id, &treasury_id, &50u32);
         pool.initialize(&admin, &nft_id, &treasury_id, &200u32);
         treasury.initialize(&admin, &50u32);
-        rr.initialize(&admin);
+        rr.initialize(&admin, &nft_id);
 
         KoraEnv {
             env,

@@ -9,7 +9,11 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 soroban-sdk = { workspace = true }
 kora-shared = { path = "../shared" }
+kora-invoice-nft = { path = "../invoice_nft" }
+kora-financing-pool = { path = "../financing_pool" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 kora-shared = { path = "../shared" }
+kora-invoice-nft = { path = "../invoice_nft" }
+kora-financing-pool = { path = "../financing_pool" }

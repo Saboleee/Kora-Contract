@@ -15,9 +15,8 @@ pub enum DataKey {
     Admin,
     /// Protocol fee in basis points — persistent for durability.
     FeeBps,
-    /// Reentrancy guard for withdrawal operations.
-    /// Absence of this key means unlocked; presence means locked.
-    WithdrawalLock,
+    Collected(Address), // accumulated fees per token (informational)
+    WithdrawalLock,     // reentrancy guard
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -32,23 +31,8 @@ impl TreasuryContract {
             return Err(KoraError::AlreadyInitialized);
         }
         require_valid_fee_bps(fee_bps)?;
-
-        env.storage().persistent().set(&DataKey::Admin, &admin);
-        env.storage().persistent().set(&DataKey::FeeBps, &fee_bps);
-        // WithdrawalLock is NOT written on init — absence means unlocked.
-
-        env.storage().persistent().extend_ttl(
-            &DataKey::Admin,
-            PERSISTENT_LIFETIME_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
-        env.storage().persistent().extend_ttl(
-            &DataKey::FeeBps,
-            PERSISTENT_LIFETIME_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
-
-        events::treasury_initialized(&env, &admin, fee_bps);
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
         Ok(())
     }
 
@@ -92,7 +76,6 @@ impl TreasuryContract {
             return Err(KoraError::InvalidAmount);
         }
 
-        // Acquire reentrancy lock before any external calls
         Self::acquire_lock(&env)?;
 
         let token_client = token::Client::new(&env, &token);
@@ -110,6 +93,7 @@ impl TreasuryContract {
 
         // Emit with admin address for full auditability
         events::fee_withdrawn(&env, &token, amount);
+        Self::release_lock(&env);
         Ok(())
     }
 
@@ -168,19 +152,21 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// Acquire reentrancy lock.
-    /// Uses key presence as the lock signal — no boolean value needed.
     fn acquire_lock(env: &Env) -> Result<(), KoraError> {
-        if env.storage().instance().has(&DataKey::WithdrawalLock) {
-            return Err(KoraError::Unauthorized); // Reentrancy detected
+        let locked: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::WithdrawalLock)
+            .unwrap_or(false);
+        if locked {
+            return Err(KoraError::Reentrancy);
         }
-        env.storage().instance().set(&DataKey::WithdrawalLock, &());
+        env.storage().instance().set(&DataKey::WithdrawalLock, &true);
         Ok(())
     }
 
-    /// Release reentrancy lock by removing the key.
     fn release_lock(env: &Env) {
-        env.storage().instance().remove(&DataKey::WithdrawalLock);
+        env.storage().instance().set(&DataKey::WithdrawalLock, &false);
     }
 }
 
@@ -207,7 +193,6 @@ mod tests {
         env.mock_all_auths();
         let contract_id = env.register_contract(None, TreasuryContract);
         let client = TreasuryContractClient::new(&env, &contract_id);
-
         let admin = Address::generate(&env);
         let result = client.try_initialize(&admin, &50u32);
         assert!(result.is_ok());
@@ -215,29 +200,26 @@ mod tests {
     }
 
     #[test]
-    fn test_initialize_already_initialized_fails() {
+    fn test_initialize_already_initialized() {
         let (env, admin, client) = setup();
         let result = client.try_initialize(&admin, &50u32);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_initialize_invalid_fee_bps_fails() {
+    fn test_initialize_invalid_fee_bps() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, TreasuryContract);
         let client = TreasuryContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
-
         let result = client.try_initialize(&admin, &10_001u32);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_set_fee_bps_success() {
-        let (env, admin, client) = setup();
-        assert_eq!(client.get_fee_bps(), 50);
-
+        let (_env, admin, client) = setup();
         client.set_fee_bps(&admin, &100u32);
         assert_eq!(client.get_fee_bps(), 100);
     }
@@ -246,53 +228,45 @@ mod tests {
     fn test_set_fee_bps_requires_admin() {
         let (env, _admin, client) = setup();
         let non_admin = Address::generate(&env);
-
         let result = client.try_set_fee_bps(&non_admin, &100u32);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_set_fee_bps_invalid_bps_fails() {
-        let (env, admin, client) = setup();
-
+        let (_env, admin, client) = setup();
         let result = client.try_set_fee_bps(&admin, &10_001u32);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_set_fee_bps_zero_succeeds() {
-        let (env, admin, client) = setup();
-
+    fn test_set_fee_bps_zero_allowed() {
+        let (_env, admin, client) = setup();
         client.set_fee_bps(&admin, &0u32);
         assert_eq!(client.get_fee_bps(), 0);
     }
 
     #[test]
-    fn test_set_fee_bps_max_succeeds() {
-        let (env, admin, client) = setup();
-
+    fn test_set_fee_bps_max_allowed() {
+        let (_env, admin, client) = setup();
         client.set_fee_bps(&admin, &10_000u32);
         assert_eq!(client.get_fee_bps(), 10_000);
     }
 
     #[test]
     fn test_set_fee_bps_over_max_fails() {
-        let (env, admin, client) = setup();
-
+        let (_env, admin, client) = setup();
         let result = client.try_set_fee_bps(&admin, &10_001u32);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_multiple_fee_updates() {
-        let (env, admin, client) = setup();
-
+    fn test_set_fee_bps_multiple_updates() {
+        let (_env, admin, client) = setup();
         client.set_fee_bps(&admin, &100u32);
         assert_eq!(client.get_fee_bps(), 100);
-
         client.set_fee_bps(&admin, &200u32);
         assert_eq!(client.get_fee_bps(), 200);
-
         client.set_fee_bps(&admin, &50u32);
         assert_eq!(client.get_fee_bps(), 50);
     }
@@ -303,7 +277,6 @@ mod tests {
         let non_admin = Address::generate(&env);
         let token = Address::generate(&env);
         let recipient = Address::generate(&env);
-
         let result = client.try_withdraw(&non_admin, &token, &recipient, &1_000_000i128);
         assert!(result.is_err());
     }
@@ -313,7 +286,6 @@ mod tests {
         let (env, admin, client) = setup();
         let token = Address::generate(&env);
         let recipient = Address::generate(&env);
-
         let result = client.try_withdraw(&admin, &token, &recipient, &0i128);
         assert!(result.is_err());
     }
@@ -323,8 +295,7 @@ mod tests {
         let (env, admin, client) = setup();
         let token = Address::generate(&env);
         let recipient = Address::generate(&env);
-
-        let result = client.try_withdraw(&admin, &token, &recipient, &-1_000_000i128);
+        let result = client.try_withdraw(&admin, &token, &recipient, &-1_000i128);
         assert!(result.is_err());
     }
 
@@ -334,35 +305,39 @@ mod tests {
         let non_admin = Address::generate(&env);
         let token = Address::generate(&env);
         let recipient = Address::generate(&env);
-
         let result = client.try_emergency_withdraw(&non_admin, &token, &recipient);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_lock_release_after_failed_withdraw() {
+    fn test_get_fee_bps_default_before_init() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, TreasuryContract);
+        let client = TreasuryContractClient::new(&env, &contract_id);
+        // Before initialization, falls back to default 50
+        assert_eq!(client.get_fee_bps(), 50);
+    }
+
+    #[test]
+    fn test_lock_released_after_failed_withdraw() {
         let (env, admin, client) = setup();
         let token = Address::generate(&env);
         let recipient = Address::generate(&env);
-
-        // Attempt withdrawal — will fail due to insufficient balance,
-        // but the lock must be released so subsequent ops succeed.
+        // Fails due to insufficient balance — lock must be released
         let _ = client.try_withdraw(&admin, &token, &recipient, &1_000i128);
-
-        // If lock was not released this would fail
+        // Subsequent admin operation must succeed (lock not stuck)
         let result = client.try_set_fee_bps(&admin, &100u32);
         assert!(result.is_ok());
     }
 
     #[test]
-    fn test_lock_release_after_emergency_withdraw() {
+    fn test_lock_released_after_emergency_withdraw() {
         let (env, admin, client) = setup();
         let token = Address::generate(&env);
         let recipient = Address::generate(&env);
-
         let _ = client.try_emergency_withdraw(&admin, &token, &recipient);
-
-        // Lock must be released
+        // Lock must be released regardless of balance
         let result = client.try_set_fee_bps(&admin, &100u32);
         assert!(result.is_ok());
     }

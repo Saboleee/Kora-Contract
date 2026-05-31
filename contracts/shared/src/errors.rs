@@ -9,7 +9,9 @@ pub enum KoraError {
     NotAdmin = 2,
     NotVerifier = 3,
     ProtocolPaused = 4,
-    NotPaused = 5,
+    AlreadyPaused = 5,
+    NotPaused = 6,
+    RoleNotAssigned = 7,
 
     // Invoice
     InvoiceNotFound = 10,
@@ -47,12 +49,9 @@ pub enum KoraError {
 
     // General
     ArithmeticOverflow = 90,
-    /// Subtraction would produce a negative result (underflow).
-    ArithmeticUnderflow = 91,
-    InvalidAddress = 92,
-    EmptyString = 93,
-    AlreadyInitialized = 94,
-    NotInitialized = 95,
-    /// Reentrancy detected — a protected function was called recursively.
-    Reentrancy = 96,
+    InvalidAddress = 91,
+    EmptyString = 92,
+    AlreadyInitialized = 93,
+    NotInitialized = 94,
+    Reentrancy = 95,
 }

@@ -1,16 +1,27 @@
 #![no_std]
 
-use kora_shared::{errors::KoraError, types::SmeProfile, validation::require_valid_risk_score};
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+use kora_shared::{
+    errors::KoraError,
+    events,
+    types::SmeProfile,
+    validation::require_valid_risk_score,
+};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env};
+
+// ── TTL constants (in ledgers; ~5s per ledger on Stellar) ────────────────────
+/// ~30 days of ledger entries for persistent SME/verifier data
+const PERSISTENT_TTL_THRESHOLD: u32 = 518_400;
+const PERSISTENT_TTL_BUMP: u32 = 518_400;
 
 // ── Storage Keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
 pub enum DataKey {
     Admin,
+    InvoiceNft,              // authorized caller for increment_invoice_count
     Verifier(Address),
     SmeProfile(Address),
-    DebtorScore(soroban_sdk::Bytes), // keyed by debtor_hash
+    DebtorScore(Bytes),      // keyed by debtor_hash (SHA-256 of PII)
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -20,35 +31,58 @@ pub struct RiskRegistryContract;
 
 #[contractimpl]
 impl RiskRegistryContract {
-    pub fn initialize(env: Env, admin: Address) -> Result<(), KoraError> {
+    /// One-time initialization. Sets admin and the authorized invoice_nft address.
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        invoice_nft: Address,
+    ) -> Result<(), KoraError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(KoraError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::InvoiceNft, &invoice_nft);
         Ok(())
     }
+
+    // ── Verifier management ───────────────────────────────────────────────────
 
     /// Admin adds a trusted verifier.
     pub fn add_verifier(env: Env, admin: Address, verifier: Address) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        let _guard = ReentrancyGuard::new(&env)?;
         env.storage()
             .persistent()
-            .set(&DataKey::Verifier(verifier), &true);
+            .set(&DataKey::Verifier(verifier.clone()), &true);
+        Self::bump_persistent(&env, &DataKey::Verifier(verifier.clone()));
+        events::verifier_added(&env, &admin, &verifier);
         Ok(())
     }
 
-    /// Admin removes a verifier.
+    /// Admin removes a verifier. Uses remove() to reclaim storage.
     pub fn remove_verifier(env: Env, admin: Address, verifier: Address) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        // Only remove if it actually exists — avoids a no-op silently succeeding
+        if !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Verifier(verifier.clone()))
+            .unwrap_or(false)
+        {
+            return Err(KoraError::NotVerifier);
+        }
         env.storage()
             .persistent()
-            .set(&DataKey::Verifier(verifier), &false);
+            .remove(&DataKey::Verifier(verifier.clone()));
+        events::verifier_removed(&env, &admin, &verifier);
         Ok(())
     }
 
-    /// Verifier registers and scores an SME.
+    // ── SME management ────────────────────────────────────────────────────────
+
+    /// Verifier registers and scores an SME. Fails if SME is already registered.
     pub fn register_sme(
         env: Env,
         verifier: Address,
@@ -58,6 +92,15 @@ impl RiskRegistryContract {
         verifier.require_auth();
         Self::require_verifier(&env, &verifier)?;
         require_valid_risk_score(risk_score)?;
+
+        // Guard against silent re-registration that would reset defaults/invoice counts
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::SmeProfile(sme.clone()))
+        {
+            return Err(KoraError::AlreadyInitialized);
+        }
 
         let profile = SmeProfile {
             address: sme.clone(),
@@ -71,7 +114,9 @@ impl RiskRegistryContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::SmeProfile(sme), &profile);
+            .set(&DataKey::SmeProfile(sme.clone()), &profile);
+        Self::bump_persistent(&env, &DataKey::SmeProfile(sme.clone()));
+        events::sme_registered(&env, &verifier, &sme, risk_score);
         Ok(())
     }
 
@@ -86,27 +131,34 @@ impl RiskRegistryContract {
         Self::require_verifier(&env, &verifier)?;
         require_valid_risk_score(new_score)?;
 
+        let _guard = ReentrancyGuard::new(&env)?;
+
         let mut profile: SmeProfile = env
             .storage()
             .persistent()
             .get(&DataKey::SmeProfile(sme.clone()))
             .ok_or(KoraError::SMENotRegistered)?;
 
+        let old_score = profile.risk_score;
         profile.risk_score = new_score;
         env.storage()
             .persistent()
-            .set(&DataKey::SmeProfile(sme), &profile);
+            .set(&DataKey::SmeProfile(sme.clone()), &profile);
+        Self::bump_persistent(&env, &DataKey::SmeProfile(sme.clone()));
+        events::sme_score_updated(&env, &verifier, &sme, new_score);
         Ok(())
     }
 
-    /// Increment invoice count for an SME. Called by Invoice NFT contract.
+    /// Increment invoice count for an SME.
+    /// Restricted to the invoice_nft contract address set at initialization.
     pub fn increment_invoice_count(
         env: Env,
         caller: Address,
         sme: Address,
     ) -> Result<(), KoraError> {
         caller.require_auth();
-        // Any registered contract can call this; in production restrict to invoice_nft address
+        Self::require_invoice_nft(&env, &caller)?;
+
         let mut profile: SmeProfile = env
             .storage()
             .persistent()
@@ -120,14 +172,16 @@ impl RiskRegistryContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::SmeProfile(sme), &profile);
+            .set(&DataKey::SmeProfile(sme.clone()), &profile);
+        Self::bump_persistent(&env, &DataKey::SmeProfile(sme));
         Ok(())
     }
 
-    /// Record a default against an SME.
+    /// Record a default against an SME. Admin only.
     pub fn record_default(env: Env, admin: Address, sme: Address) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        let _guard = ReentrancyGuard::new(&env)?;
 
         let mut profile: SmeProfile = env
             .storage()
@@ -142,23 +196,31 @@ impl RiskRegistryContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::SmeProfile(sme), &profile);
+            .set(&DataKey::SmeProfile(sme.clone()), &profile);
+        Self::bump_persistent(&env, &DataKey::SmeProfile(sme.clone()));
+        events::sme_default_recorded(&env, &admin, &sme, profile.defaults);
         Ok(())
     }
 
-    /// Store a debtor risk score keyed by debtor hash.
+    /// Store a debtor risk score keyed by debtor hash. Verifier only.
     pub fn set_debtor_score(
         env: Env,
         verifier: Address,
-        debtor_hash: soroban_sdk::Bytes,
+        debtor_hash: Bytes,
         score: u32,
     ) -> Result<(), KoraError> {
         verifier.require_auth();
         Self::require_verifier(&env, &verifier)?;
+        require_non_empty_bytes(&debtor_hash)?;
         require_valid_risk_score(score)?;
+        if debtor_hash.len() == 0 {
+            return Err(KoraError::EmptyString);
+        }
         env.storage()
             .persistent()
-            .set(&DataKey::DebtorScore(debtor_hash), &score);
+            .set(&DataKey::DebtorScore(debtor_hash.clone()), &score);
+        Self::bump_persistent(&env, &DataKey::DebtorScore(debtor_hash));
+        events::debtor_score_set(&env, &verifier, score);
         Ok(())
     }
 
@@ -186,10 +248,22 @@ impl RiskRegistryContract {
             .unwrap_or(false)
     }
 
-    pub fn get_debtor_score(env: Env, debtor_hash: soroban_sdk::Bytes) -> Option<u32> {
+    /// Returns the debtor score or `KoraError::DebtorNotRegistered` if not found.
+    pub fn get_debtor_score(
+        env: Env,
+        debtor_hash: Bytes,
+    ) -> Result<u32, KoraError> {
         env.storage()
             .persistent()
             .get(&DataKey::DebtorScore(debtor_hash))
+            .ok_or(KoraError::DebtorNotRegistered)
+    }
+
+    pub fn get_admin(env: Env) -> Result<Address, KoraError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(KoraError::NotInitialized)
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -217,6 +291,25 @@ impl RiskRegistryContract {
         }
         Ok(())
     }
+
+    fn require_invoice_nft(env: &Env, caller: &Address) -> Result<(), KoraError> {
+        let invoice_nft: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::InvoiceNft)
+            .ok_or(KoraError::NotInitialized)?;
+        if &invoice_nft != caller {
+            return Err(KoraError::Unauthorized);
+        }
+        Ok(())
+    }
+
+    /// Extend TTL on a persistent entry if it's below the threshold.
+    fn bump_persistent(env: &Env, key: &DataKey) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_BUMP);
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -226,15 +319,19 @@ mod tests {
     use super::*;
     use soroban_sdk::{testutils::Address as _, Bytes, Env};
 
-    fn setup() -> (Env, Address, RiskRegistryContractClient<'static>) {
+    /// Returns (env, admin, invoice_nft, client)
+    fn setup() -> (Env, Address, Address, RiskRegistryContractClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, RiskRegistryContract);
         let client = RiskRegistryContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
-        client.initialize(&admin);
-        (env, admin, client)
+        let invoice_nft = Address::generate(&env);
+        client.initialize(&admin, &invoice_nft);
+        (env, admin, invoice_nft, client)
     }
+
+    // ── initialize ────────────────────────────────────────────────────────────
 
     #[test]
     fn test_initialize_success() {
@@ -243,274 +340,416 @@ mod tests {
         let contract_id = env.register_contract(None, RiskRegistryContract);
         let client = RiskRegistryContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
-
-        let result = client.try_initialize(&admin);
-        assert!(result.is_ok());
+        let invoice_nft = Address::generate(&env);
+        assert!(client.try_initialize(&admin, &invoice_nft).is_ok());
     }
 
     #[test]
     fn test_initialize_already_initialized() {
-        let (env, admin, client) = setup();
-        let result = client.try_initialize(&admin);
-        assert!(result.is_err());
+        let (env, admin, invoice_nft, client) = setup();
+        assert!(client.try_initialize(&admin, &invoice_nft).is_err());
     }
+
+    // ── add_verifier / remove_verifier ────────────────────────────────────────
 
     #[test]
     fn test_add_verifier_success() {
-        let (env, admin, client) = setup();
+        let (env, admin, _, client) = setup();
         let verifier = Address::generate(&env);
-
-        let result = client.try_add_verifier(&admin, &verifier);
-        assert!(result.is_ok());
+        assert!(client.try_add_verifier(&admin, &verifier).is_ok());
         assert!(client.is_verifier(&verifier));
     }
 
     #[test]
     fn test_add_verifier_not_admin() {
-        let (env, _admin, client) = setup();
-        let verifier = Address::generate(&env);
+        let (env, _, _, client) = setup();
         let stranger = Address::generate(&env);
-
-        let result = client.try_add_verifier(&stranger, &verifier);
-        assert!(result.is_err());
+        let verifier = Address::generate(&env);
+        assert!(client.try_add_verifier(&stranger, &verifier).is_err());
     }
 
     #[test]
     fn test_remove_verifier_success() {
-        let (env, admin, client) = setup();
+        let (env, admin, _, client) = setup();
         let verifier = Address::generate(&env);
-
         client.add_verifier(&admin, &verifier);
         assert!(client.is_verifier(&verifier));
-
-        client.remove_verifier(&admin, &verifier);
+        assert!(client.try_remove_verifier(&admin, &verifier).is_ok());
         assert!(!client.is_verifier(&verifier));
     }
 
     #[test]
+    fn test_remove_verifier_not_admin() {
+        let (env, admin, _, client) = setup();
+        let verifier = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        client.add_verifier(&admin, &verifier);
+        assert!(client.try_remove_verifier(&stranger, &verifier).is_err());
+    }
+
+    #[test]
+    fn test_remove_verifier_not_registered() {
+        let (env, admin, _, client) = setup();
+        let verifier = Address::generate(&env);
+        // Removing a verifier that was never added should fail
+        assert!(client.try_remove_verifier(&admin, &verifier).is_err());
+    }
+
+    #[test]
+    fn test_multiple_verifiers() {
+        let (env, admin, _, client) = setup();
+        let v1 = Address::generate(&env);
+        let v2 = Address::generate(&env);
+        let sme1 = Address::generate(&env);
+        let sme2 = Address::generate(&env);
+
+        client.add_verifier(&admin, &v1);
+        client.add_verifier(&admin, &v2);
+        client.register_sme(&v1, &sme1, &30u32);
+        client.register_sme(&v2, &sme2, &60u32);
+
+        assert_eq!(client.get_sme_profile(&sme1).risk_score, 30);
+        assert_eq!(client.get_sme_profile(&sme2).risk_score, 60);
+        assert_eq!(client.get_sme_profile(&sme1).verifier, v1);
+        assert_eq!(client.get_sme_profile(&sme2).verifier, v2);
+    }
+
+    // ── register_sme ──────────────────────────────────────────────────────────
+
+    #[test]
     fn test_register_sme_flow() {
-        let (env, admin, client) = setup();
+        let (env, admin, _, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
 
         client.add_verifier(&admin, &verifier);
-        assert!(client.is_verifier(&verifier));
-
         client.register_sme(&verifier, &sme, &35u32);
-        assert!(client.is_verified_sme(&sme));
 
+        assert!(client.is_verified_sme(&sme));
         let profile = client.get_sme_profile(&sme);
         assert_eq!(profile.risk_score, 35);
         assert_eq!(profile.defaults, 0);
         assert_eq!(profile.total_invoices, 0);
         assert!(profile.verified);
+        assert_eq!(profile.verifier, verifier);
+    }
+
+    #[test]
+    fn test_register_sme_duplicate_rejected() {
+        let (env, admin, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+
+        client.add_verifier(&admin, &verifier);
+        client.register_sme(&verifier, &sme, &35u32);
+        // Second registration of the same SME must fail
+        assert!(client.try_register_sme(&verifier, &sme, &50u32).is_err());
     }
 
     #[test]
     fn test_register_sme_unverified_verifier() {
-        let (env, _admin, client) = setup();
+        let (env, _, _, client) = setup();
         let stranger = Address::generate(&env);
         let sme = Address::generate(&env);
-
-        let result = client.try_register_sme(&stranger, &sme, &10u32);
-        assert!(result.is_err());
+        assert!(client.try_register_sme(&stranger, &sme, &10u32).is_err());
     }
 
     #[test]
     fn test_register_sme_invalid_risk_score() {
-        let (env, admin, client) = setup();
+        let (env, admin, _, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
-
         client.add_verifier(&admin, &verifier);
-
-        let result = client.try_register_sme(&verifier, &sme, &101u32);
-        assert!(result.is_err());
+        assert!(client.try_register_sme(&verifier, &sme, &101u32).is_err());
     }
 
     #[test]
-    fn test_update_sme_score_success() {
-        let (env, admin, client) = setup();
+    fn test_register_sme_already_registered() {
+        // Re-registration must fail to protect existing defaults/invoice counts
+        let (env, admin, _, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
-
         client.add_verifier(&admin, &verifier);
         client.register_sme(&verifier, &sme, &35u32);
+        assert!(client.try_register_sme(&verifier, &sme, &50u32).is_err());
+    }
 
-        client.update_sme_score(&verifier, &sme, &50u32);
+    #[test]
+    fn test_register_sme_preserves_history_on_re_registration_attempt() {
+        // After a failed re-registration, original data must be intact
+        let (env, admin, _, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+        client.add_verifier(&admin, &verifier);
+        client.register_sme(&verifier, &sme, &35u32);
+        // Attempt re-registration (should fail)
+        let _ = client.try_register_sme(&verifier, &sme, &99u32);
         let profile = client.get_sme_profile(&sme);
-        assert_eq!(profile.risk_score, 50);
+        assert_eq!(profile.risk_score, 35); // unchanged
+    }
+
+    // ── update_sme_score ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_update_sme_score_success() {
+        let (env, admin, _, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+        client.add_verifier(&admin, &verifier);
+        client.register_sme(&verifier, &sme, &35u32);
+        client.update_sme_score(&verifier, &sme, &50u32);
+        assert_eq!(client.get_sme_profile(&sme).risk_score, 50);
     }
 
     #[test]
     fn test_update_sme_score_not_registered() {
-        let (env, admin, client) = setup();
+        let (env, admin, _, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
-
         client.add_verifier(&admin, &verifier);
-
-        let result = client.try_update_sme_score(&verifier, &sme, &50u32);
-        assert!(result.is_err());
+        assert!(client.try_update_sme_score(&verifier, &sme, &50u32).is_err());
     }
 
     #[test]
-    fn test_increment_invoice_count() {
-        let (env, admin, client) = setup();
+    fn test_update_sme_score_invalid() {
+        let (env, admin, _, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
-        let caller = Address::generate(&env);
+        client.add_verifier(&admin, &verifier);
+        client.register_sme(&verifier, &sme, &35u32);
+        assert!(client.try_update_sme_score(&verifier, &sme, &101u32).is_err());
+    }
 
+    #[test]
+    fn test_update_sme_score_boundary_values() {
+        let (env, admin, _, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+        client.add_verifier(&admin, &verifier);
+        client.register_sme(&verifier, &sme, &50u32);
+
+        client.update_sme_score(&verifier, &sme, &0u32);
+        assert_eq!(client.get_sme_profile(&sme).risk_score, 0);
+
+        client.update_sme_score(&verifier, &sme, &100u32);
+        assert_eq!(client.get_sme_profile(&sme).risk_score, 100);
+    }
+
+    // ── increment_invoice_count ───────────────────────────────────────────────
+
+    #[test]
+    fn test_increment_invoice_count() {
+        let (env, admin, invoice_nft, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
         client.add_verifier(&admin, &verifier);
         client.register_sme(&verifier, &sme, &35u32);
 
-        let profile_before = client.get_sme_profile(&sme);
-        assert_eq!(profile_before.total_invoices, 0);
-
-        client.increment_invoice_count(&caller, &sme);
-        let profile_after = client.get_sme_profile(&sme);
-        assert_eq!(profile_after.total_invoices, 1);
+        assert_eq!(client.get_sme_profile(&sme).total_invoices, 0);
+        client.increment_invoice_count(&invoice_nft, &sme);
+        assert_eq!(client.get_sme_profile(&sme).total_invoices, 1);
     }
 
     #[test]
     fn test_increment_invoice_count_multiple() {
-        let (env, admin, client) = setup();
+        let (env, admin, invoice_nft, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
-        let caller = Address::generate(&env);
-
         client.add_verifier(&admin, &verifier);
         client.register_sme(&verifier, &sme, &35u32);
 
-        for i in 1..=5 {
-            client.increment_invoice_count(&caller, &sme);
-            let profile = client.get_sme_profile(&sme);
-            assert_eq!(profile.total_invoices, i as u32);
+        for i in 1u32..=5 {
+            client.increment_invoice_count(&invoice_nft, &sme);
+            assert_eq!(client.get_sme_profile(&sme).total_invoices, i);
         }
     }
 
     #[test]
-    fn test_record_default() {
-        let (env, admin, client) = setup();
+    fn test_increment_invoice_count_unauthorized_caller() {
+        // Only the invoice_nft address may call this
+        let (env, admin, _, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        client.add_verifier(&admin, &verifier);
+        client.register_sme(&verifier, &sme, &35u32);
+        assert!(client.try_increment_invoice_count(&stranger, &sme).is_err());
+    }
 
+    #[test]
+    fn test_increment_invoice_count_sme_not_registered() {
+        let (env, _, invoice_nft, client) = setup();
+        let sme = Address::generate(&env);
+        assert!(client.try_increment_invoice_count(&invoice_nft, &sme).is_err());
+    }
+
+    // ── record_default ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_record_default() {
+        let (env, admin, _, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
         client.add_verifier(&admin, &verifier);
         client.register_sme(&verifier, &sme, &35u32);
 
-        let profile_before = client.get_sme_profile(&sme);
-        assert_eq!(profile_before.defaults, 0);
-
+        assert_eq!(client.get_sme_profile(&sme).defaults, 0);
         client.record_default(&admin, &sme);
-        let profile_after = client.get_sme_profile(&sme);
-        assert_eq!(profile_after.defaults, 1);
+        assert_eq!(client.get_sme_profile(&sme).defaults, 1);
     }
 
     #[test]
     fn test_record_default_not_admin() {
-        let (env, admin, client) = setup();
+        let (env, admin, _, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         let stranger = Address::generate(&env);
-
         client.add_verifier(&admin, &verifier);
         client.register_sme(&verifier, &sme, &35u32);
-
-        let result = client.try_record_default(&stranger, &sme);
-        assert!(result.is_err());
+        assert!(client.try_record_default(&stranger, &sme).is_err());
     }
 
     #[test]
+    fn test_record_default_sme_not_registered() {
+        let (env, admin, _, client) = setup();
+        let sme = Address::generate(&env);
+        assert!(client.try_record_default(&admin, &sme).is_err());
+    }
+
+    #[test]
+    fn test_record_multiple_defaults() {
+        let (env, admin, _, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+        client.add_verifier(&admin, &verifier);
+        client.register_sme(&verifier, &sme, &35u32);
+
+        client.record_default(&admin, &sme);
+        client.record_default(&admin, &sme);
+        client.record_default(&admin, &sme);
+        assert_eq!(client.get_sme_profile(&sme).defaults, 3);
+    }
+
+    // ── set_debtor_score / get_debtor_score ───────────────────────────────────
+
+    #[test]
     fn test_set_debtor_score() {
-        let (env, admin, client) = setup();
+        let (env, admin, _, client) = setup();
         let verifier = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[0xABu8; 32]);
-
         client.add_verifier(&admin, &verifier);
         client.set_debtor_score(&verifier, &debtor_hash, &45u32);
-
-        let score = client.get_debtor_score(&debtor_hash);
-        assert_eq!(score, Some(45u32));
+        assert_eq!(client.get_debtor_score(&debtor_hash).unwrap(), 45u32);
     }
 
     #[test]
     fn test_set_debtor_score_invalid_score() {
-        let (env, admin, client) = setup();
+        let (env, admin, _, client) = setup();
         let verifier = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[0xABu8; 32]);
-
         client.add_verifier(&admin, &verifier);
-
-        let result = client.try_set_debtor_score(&verifier, &debtor_hash, &101u32);
-        assert!(result.is_err());
+        assert!(client.try_set_debtor_score(&verifier, &debtor_hash, &101u32).is_err());
     }
 
     #[test]
-    fn test_get_sme_profile_not_found() {
-        let (env, _admin, client) = setup();
-        let sme = Address::generate(&env);
-
-        let result = client.try_get_sme_profile(&sme);
-        assert!(result.is_err());
+    fn test_set_debtor_score_empty_hash() {
+        let (env, admin, _, client) = setup();
+        let verifier = Address::generate(&env);
+        let empty_hash = Bytes::from_slice(&env, &[]);
+        client.add_verifier(&admin, &verifier);
+        assert!(client.try_set_debtor_score(&verifier, &empty_hash, &50u32).is_err());
     }
 
     #[test]
-    fn test_is_verified_sme_false_for_unregistered() {
-        let (env, _admin, client) = setup();
-        let sme = Address::generate(&env);
-
-        assert!(!client.is_verified_sme(&sme));
+    fn test_set_debtor_score_not_verifier() {
+        let (env, _, _, client) = setup();
+        let stranger = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[0xABu8; 32]);
+        assert!(client.try_set_debtor_score(&stranger, &debtor_hash, &50u32).is_err());
     }
 
     #[test]
     fn test_get_debtor_score_not_found() {
-        let (env, _admin, client) = setup();
+        let (env, _, _, client) = setup();
         let debtor_hash = Bytes::from_slice(&env, &[0xCDu8; 32]);
-
-        let score = client.get_debtor_score(&debtor_hash);
-        assert_eq!(score, None);
+        // Now returns Result, not Option
+        assert!(client.try_get_debtor_score(&debtor_hash).is_err());
     }
+
+    #[test]
+    fn test_debtor_score_boundary_values() {
+        let (env, admin, _, client) = setup();
+        let verifier = Address::generate(&env);
+        client.add_verifier(&admin, &verifier);
+
+        let hash0 = Bytes::from_slice(&env, &[0x01u8; 32]);
+        client.set_debtor_score(&verifier, &hash0, &0u32);
+        assert_eq!(client.get_debtor_score(&hash0).unwrap(), 0u32);
+
+        let hash100 = Bytes::from_slice(&env, &[0x02u8; 32]);
+        client.set_debtor_score(&verifier, &hash100, &100u32);
+        assert_eq!(client.get_debtor_score(&hash100).unwrap(), 100u32);
+
+        let hash_invalid = Bytes::from_slice(&env, &[0x03u8; 32]);
+        assert!(client.try_set_debtor_score(&verifier, &hash_invalid, &101u32).is_err());
+    }
+
+    // ── views ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_get_sme_profile_not_found() {
+        let (env, _, _, client) = setup();
+        let sme = Address::generate(&env);
+        assert!(client.try_get_sme_profile(&sme).is_err());
+    }
+
+    #[test]
+    fn test_is_verified_sme_false_for_unregistered() {
+        let (env, _, _, client) = setup();
+        let sme = Address::generate(&env);
+        assert!(!client.is_verified_sme(&sme));
+    }
+
+    // ── risk score boundary ───────────────────────────────────────────────────
 
     #[test]
     fn test_risk_score_boundary_values() {
-        let (env, admin, client) = setup();
+        let (env, admin, _, client) = setup();
         let verifier = Address::generate(&env);
-
         client.add_verifier(&admin, &verifier);
 
-        // Test boundary: 0 (valid)
-        let sme1 = Address::generate(&env);
-        client.register_sme(&verifier, &sme1, &0u32);
-        assert_eq!(client.get_sme_profile(&sme1).risk_score, 0);
+        let sme0 = Address::generate(&env);
+        client.register_sme(&verifier, &sme0, &0u32);
+        assert_eq!(client.get_sme_profile(&sme0).risk_score, 0);
 
-        // Test boundary: 100 (valid)
-        let sme2 = Address::generate(&env);
-        client.register_sme(&verifier, &sme2, &100u32);
-        assert_eq!(client.get_sme_profile(&sme2).risk_score, 100);
+        let sme100 = Address::generate(&env);
+        client.register_sme(&verifier, &sme100, &100u32);
+        assert_eq!(client.get_sme_profile(&sme100).risk_score, 100);
 
-        // Test boundary: 101 (invalid)
-        let sme3 = Address::generate(&env);
-        let result = client.try_register_sme(&verifier, &sme3, &101u32);
-        assert!(result.is_err());
+        let sme_invalid = Address::generate(&env);
+        assert!(client.try_register_sme(&verifier, &sme_invalid, &101u32).is_err());
     }
 
     #[test]
-    fn test_multiple_verifiers() {
+    fn test_transfer_admin_success() {
         let (env, admin, client) = setup();
-        let verifier1 = Address::generate(&env);
-        let verifier2 = Address::generate(&env);
-        let sme1 = Address::generate(&env);
-        let sme2 = Address::generate(&env);
+        let new_admin = Address::generate(&env);
 
-        client.add_verifier(&admin, &verifier1);
-        client.add_verifier(&admin, &verifier2);
+        client.transfer_admin(&admin, &new_admin);
+        assert_eq!(client.get_admin(), new_admin);
+    }
 
-        client.register_sme(&verifier1, &sme1, &30u32);
-        client.register_sme(&verifier2, &sme2, &60u32);
+    #[test]
+    fn test_transfer_admin_same_address_rejected() {
+        let (_, admin, client) = setup();
+        assert!(client.try_transfer_admin(&admin, &admin).is_err());
+    }
 
-        assert_eq!(client.get_sme_profile(&sme1).risk_score, 30);
-        assert_eq!(client.get_sme_profile(&sme2).risk_score, 60);
-        assert_eq!(client.get_sme_profile(&sme1).verifier, verifier1);
-        assert_eq!(client.get_sme_profile(&sme2).verifier, verifier2);
+    #[test]
+    fn test_transfer_admin_non_admin_rejected() {
+        let (env, _admin, client) = setup();
+        let stranger = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+        assert!(client.try_transfer_admin(&stranger, &new_admin).is_err());
     }
 }

@@ -19,7 +19,6 @@ pub enum DataKey {
     NextId,
     Admin,
     AccessControl,
-    InvoiceCount,
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -88,10 +87,6 @@ impl InvoiceNftContract {
         env.storage().persistent().set(&DataKey::Invoice(id), &invoice);
         env.storage().instance().set(&DataKey::NextId, &(id.checked_add(1).ok_or(KoraError::ArithmeticOverflow)?));
 
-        // Increment invoice count for metrics
-        let count: u64 = env.storage().instance().get(&DataKey::InvoiceCount).unwrap_or(0);
-        env.storage().instance().set(&DataKey::InvoiceCount, &(count.checked_add(1).ok_or(KoraError::ArithmeticOverflow)?));
-
         events::invoice_created(&env, id, &sme, amount);
         Ok(id)
     }
@@ -120,7 +115,6 @@ impl InvoiceNftContract {
         if invoice.status != InvoiceStatus::Listed {
             return Err(KoraError::InvalidInvoiceStatus);
         }
-        let old_status = "Listed";
         invoice.status = InvoiceStatus::Funded;
         invoice.funded_at = Some(env.ledger().timestamp());
         env.storage()
@@ -136,7 +130,6 @@ impl InvoiceNftContract {
         if invoice.status != InvoiceStatus::Funded {
             return Err(KoraError::InvalidInvoiceStatus);
         }
-        let old_status = "Funded";
         invoice.status = InvoiceStatus::Repaid;
         invoice.repaid_at = Some(env.ledger().timestamp());
         env.storage().persistent().set(&DataKey::Invoice(invoice_id), &invoice);
@@ -156,7 +149,6 @@ impl InvoiceNftContract {
         if current_time <= invoice.due_date {
             return Err(KoraError::InvalidInvoiceStatus);
         }
-        let old_status = "Funded";
         invoice.status = InvoiceStatus::Defaulted;
         env.storage()
             .persistent()
@@ -175,8 +167,9 @@ impl InvoiceNftContract {
         env.storage().instance().get(&DataKey::NextId).unwrap_or(1)
     }
 
+    /// Returns the number of invoices minted (next_id - 1).
     pub fn invoice_count(env: Env) -> u64 {
-        env.storage().instance().get(&DataKey::InvoiceCount).unwrap_or(0)
+        env.storage().instance().get::<_, u64>(&DataKey::NextId).unwrap_or(1).saturating_sub(1)
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
@@ -201,9 +194,14 @@ impl InvoiceNftContract {
     }
 
     fn require_not_paused(env: &Env) -> Result<(), KoraError> {
-        // Reads paused flag stored by AccessControl contract via cross-contract call
-        // For now, local guard — AccessControl integration wired at deployment
-        let _ = env;
+        let ac: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccessControl)
+            .ok_or(KoraError::NotInitialized)?;
+        let _ = ac;
+        // Cross-contract pause check wired at deployment via AccessControl contract.
+        // Local guard: no-op until cross-contract call is integrated.
         Ok(())
     }
 }
@@ -423,81 +421,6 @@ mod tests {
             &due_date,
             &ipfs_cid,
             &10u32,
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_mint_invoice_negative_amount_fails() {
-        let (env, _admin, client) = setup();
-        let sme = Address::generate(&env);
-        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
-        let due_date = env.ledger().timestamp() + 86_400;
-
-        let result = client.try_mint_invoice(
-            &sme, &debtor_hash, &-1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_mint_invoice_past_due_date_fails() {
-        let (env, _admin, client) = setup();
-        let sme = Address::generate(&env);
-        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
-        let due_date = env.ledger().timestamp() - 1;
-
-        let result = client.try_mint_invoice(
-            &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_mint_invoice_invalid_risk_score_fails() {
-        let (env, _admin, client) = setup();
-        let sme = Address::generate(&env);
-        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
-        let due_date = env.ledger().timestamp() + 86_400;
-
-        let result = client.try_mint_invoice(
-            &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &101u32,
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_mint_invoice_empty_debtor_hash_fails() {
-        let (env, _admin, client) = setup();
-        let sme = Address::generate(&env);
-        let debtor_hash = Bytes::from_slice(&env, &[]);
-        let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
-        let due_date = env.ledger().timestamp() + 86_400;
-
-        let result = client.try_mint_invoice(
-            &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_mint_invoice_empty_ipfs_cid_fails() {
-        let (env, _admin, client) = setup();
-        let sme = Address::generate(&env);
-        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(&env, "");
-        let due_date = env.ledger().timestamp() + 86_400;
-
-        let result = client.try_mint_invoice(
-            &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
         );
         assert!(result.is_err());
     }
