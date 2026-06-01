@@ -11,35 +11,6 @@ pub enum GuardKey {
     Lock,
 }
 
-// ── RAII guard ────────────────────────────────────────────────────────────────
-
-/// RAII reentrancy guard. Acquires the lock on construction and releases it
-/// when dropped, ensuring the lock is always released even on early returns.
-///
-/// # Usage
-/// ```rust,ignore
-/// let _guard = ReentrancyGuard::new(&env)?;
-/// // ... protected logic ...
-/// // lock is released automatically when _guard goes out of scope
-/// ```
-pub struct ReentrancyGuard<'a> {
-    env: &'a Env,
-}
-
-impl<'a> ReentrancyGuard<'a> {
-    /// Acquire the reentrancy lock. Returns `KoraError::Reentrancy` if already held.
-    pub fn new(env: &'a Env) -> Result<Self, KoraError> {
-        acquire_guard(env)?;
-        Ok(Self { env })
-    }
-}
-
-impl<'a> Drop for ReentrancyGuard<'a> {
-    fn drop(&mut self) {
-        release_guard(self.env);
-    }
-}
-
 // ── Low-level helpers ─────────────────────────────────────────────────────────
 
 /// Acquire the reentrancy lock.

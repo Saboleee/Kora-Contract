@@ -3,7 +3,8 @@
 use kora_shared::{
     errors::KoraError,
     events,
-    validation::require_valid_fee_bps,
+    reentrancy::ReentrancyGuard,
+    validation::{require_non_zero_amount, require_valid_fee_bps},
 };
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
 
@@ -21,8 +22,8 @@ pub enum DataKey {
     FeeBps,
     /// Accumulated fees per token (informational).
     Collected(Address),
-    /// Reentrancy guard for withdrawal functions.
-    WithdrawalLock,
+    /// Whitelisted token flag.
+    WhitelistedToken(Address),
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -34,7 +35,6 @@ pub struct TreasuryContract;
 impl TreasuryContract {
     /// One-time initialization. Sets admin and protocol fee.
     pub fn initialize(env: Env, admin: Address, fee_bps: u32) -> Result<(), KoraError> {
-        // Use persistent storage consistently — same store read by require_admin
         if env.storage().persistent().has(&DataKey::Admin) {
             return Err(KoraError::AlreadyInitialized);
         }
@@ -113,7 +113,7 @@ impl TreasuryContract {
     }
 
     /// Withdraw accumulated fees to a recipient. Admin only.
-    /// Protected against reentrancy via an instance-storage lock key.
+    /// Protected against reentrancy via RAII guard.
     pub fn withdraw(
         env: Env,
         admin: Address,
@@ -127,31 +127,22 @@ impl TreasuryContract {
         require_non_zero_amount(amount)?;
         Self::require_whitelisted_token(&env, &token)?;
 
-        // Validate amount before acquiring the lock to avoid unnecessary state mutation
-        if amount <= 0 {
-            return Err(KoraError::InvalidAmount);
-        }
-
-        Self::acquire_lock(&env)?;
+        let _guard = ReentrancyGuard::new(&env)?;
 
         let token_client = token::Client::new(&env, &token);
         let balance = token_client.balance(&env.current_contract_address());
 
         if balance < amount {
-            // Release lock before returning error — must not leave lock stuck
-            Self::release_lock(&env);
             return Err(KoraError::InsufficientPoolBalance);
         }
 
         // ── Effects ───────────────────────────────────────────────────────────
-        // Deduct from informational accounting if tracked
         let collected_key = DataKey::Collected(token.clone());
         if let Some(collected) = env
             .storage()
             .persistent()
             .get::<_, i128>(&collected_key)
         {
-            // Saturating sub: accounting is informational, don't revert on mismatch
             let new_collected = collected.saturating_sub(amount);
             env.storage()
                 .persistent()
@@ -167,7 +158,7 @@ impl TreasuryContract {
     }
 
     /// Emergency drain — withdraw entire token balance. Admin only.
-    /// Protected against reentrancy via an instance-storage lock key.
+    /// Protected against reentrancy via RAII guard.
     pub fn emergency_withdraw(
         env: Env,
         admin: Address,
@@ -179,27 +170,17 @@ impl TreasuryContract {
         Self::require_admin(&env, &admin)?;
         Self::require_whitelisted_token(&env, &token)?;
 
-        // Acquire reentrancy guard — released automatically when _guard drops
         let _guard = ReentrancyGuard::new(&env)?;
 
         let token_client = token::Client::new(&env, &token);
         let balance = token_client.balance(&env.current_contract_address());
 
+        // ── Interactions ──────────────────────────────────────────────────────
         if balance > 0 {
             token_client.transfer(&env.current_contract_address(), &recipient, &balance);
-        }
-
-        // Always release lock regardless of whether a transfer occurred
-        Self::release_lock(&env);
-
-        if balance > 0 {
             events::emergency_withdrawn(&env, &admin, &token, balance);
         }
 
-        // ── Interactions ──────────────────────────────────────────────────────
-        token_client.transfer(&env.current_contract_address(), &recipient, &balance);
-
-        events::emergency_withdrawn(&env, &admin, &token, balance);
         Ok(())
     }
 
@@ -249,8 +230,12 @@ impl TreasuryContract {
         Ok(())
     }
 
-    fn release_lock(env: &Env) {
-        env.storage().instance().set(&DataKey::WithdrawalLock, &false);
+    fn bump_persistent(env: &Env, key: &DataKey) {
+        env.storage().persistent().extend_ttl(
+            key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
     }
 }
 
@@ -409,7 +394,7 @@ mod tests {
         let (env, admin, client) = setup();
         let token = Address::generate(&env);
         let recipient = Address::generate(&env);
-        // Fails due to insufficient balance — lock must be released
+        // Fails due to token not whitelisted — lock must be released
         let _ = client.try_withdraw(&admin, &token, &recipient, &1_000i128);
         // Subsequent admin operation must succeed (lock not stuck)
         assert!(client.try_set_fee_bps(&admin, &100u32).is_ok());

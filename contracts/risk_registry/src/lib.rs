@@ -34,13 +34,15 @@ pub struct RiskRegistryContract;
 impl RiskRegistryContract {
     /// One-time initialization. Sets admin and the authorized invoice_nft address.
     pub fn initialize(env: Env, admin: Address, invoice_nft: Address) -> Result<(), KoraError> {
-        if env.storage().instance().has(&DataKey::Admin) {
+        if env.storage().persistent().has(&DataKey::Admin) {
             return Err(KoraError::AlreadyInitialized);
         }
-        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().persistent().set(&DataKey::Admin, &admin);
+        Self::bump_persistent(&env, &DataKey::Admin);
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::InvoiceNft, &invoice_nft);
+        Self::bump_persistent(&env, &DataKey::InvoiceNft);
         Ok(())
     }
 
@@ -48,7 +50,8 @@ impl RiskRegistryContract {
     pub fn transfer_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().persistent().set(&DataKey::Admin, &new_admin);
+        Self::bump_persistent(&env, &DataKey::Admin);
         events::admin_transferred(&env, &new_admin);
         Ok(())
     }
@@ -271,7 +274,7 @@ impl RiskRegistryContract {
 
     pub fn get_admin(env: Env) -> Result<Address, KoraError> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Admin)
             .ok_or(KoraError::NotInitialized)
     }
@@ -281,7 +284,7 @@ impl RiskRegistryContract {
     fn require_admin(env: &Env, caller: &Address) -> Result<(), KoraError> {
         let admin: Address = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Admin)
             .ok_or(KoraError::NotInitialized)?;
         if &admin != caller {
@@ -305,7 +308,7 @@ impl RiskRegistryContract {
     fn require_invoice_nft(env: &Env, caller: &Address) -> Result<(), KoraError> {
         let invoice_nft: Address = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::InvoiceNft)
             .ok_or(KoraError::NotInitialized)?;
         if &invoice_nft != caller {

@@ -1,21 +1,15 @@
 #![no_std]
 
-//! # Kora Shared Library — Audit Findings
+//! # Kora Shared Library
 //!
-//! ## Summary of Findings and Fixes
+//! Common types, errors, events, and validation utilities for the Kora Protocol.
 //!
-//! ### 1. Missing Doc Comments on Validation Helpers (validation.rs)
-//! - **Issue:** All public validation functions lacked doc comments
-//! - **Fix:** AUDIT FIX: Added comprehensive /// doc comments to every public function
-//! - **Severity:** Medium — Documentation completeness
-//!
-//! ### 2. Incorrect Error Type for Empty Bytes (validation.rs:39-43)
-//! - **Issue:** `require_non_empty_bytes()` returned `EmptyString` error (semantically wrong for bytes)
-//! - **Fix:** AUDIT FIX: Changed to return dedicated `EmptyBytes` error for semantic clarity
-//! - **Severity:** Low — Error categorization/semantics
-//!
-//! All arithmetic operations use checked methods. All type definitions are well-documented.
-//! Error enum is comprehensive and specific.
+//! ## Modules
+//! - `types`      — Core on-chain data structures (Invoice, Listing, Pool, etc.)
+//! - `errors`     — Protocol-wide error enum (`KoraError`)
+//! - `events`     — Standardized event emission helpers
+//! - `validation` — Input validation and safe arithmetic helpers
+//! - `reentrancy` — RAII reentrancy guard
 
 pub mod errors;
 pub mod events;

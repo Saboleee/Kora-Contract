@@ -8,3 +8,8 @@ test_snapshots/
 issues.md
 generate_issues.py
 waves-issues.md
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
