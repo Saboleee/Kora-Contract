@@ -93,7 +93,14 @@ mod integration {
             "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
         );
         let risk_score = 30u32;
-        (debtor_hash, amount, currency, due_date, ipfs_cid, risk_score)
+        (
+            debtor_hash,
+            amount,
+            currency,
+            due_date,
+            ipfs_cid,
+            risk_score,
+        )
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────
@@ -130,16 +137,14 @@ mod integration {
         );
 
         // 3. Transition to Funded (simulating pool call)
-        k.invoice_nft
-            .set_funded(&k.pool.address, &invoice_id);
+        k.invoice_nft.set_funded(&k.pool.address, &invoice_id);
         assert_eq!(
             k.invoice_nft.get_invoice(&invoice_id).status,
             InvoiceStatus::Funded
         );
 
         // 4. Repay (simulating pool repay call)
-        k.invoice_nft
-            .set_repaid(&k.pool.address, &invoice_id);
+        k.invoice_nft.set_repaid(&k.pool.address, &invoice_id);
         assert_eq!(
             k.invoice_nft.get_invoice(&invoice_id).status,
             InvoiceStatus::Repaid
@@ -192,8 +197,7 @@ mod integration {
     fn test_mint_invalid_risk_score_rejected() {
         let k = deploy_protocol();
         let sme = Address::generate(&k.env);
-        let (debtor_hash, amount, currency, due_date, ipfs_cid, _) =
-            sample_invoice_params(&k.env);
+        let (debtor_hash, amount, currency, due_date, ipfs_cid, _) = sample_invoice_params(&k.env);
 
         let result = k.invoice_nft.try_mint_invoice(
             &sme,
@@ -278,7 +282,9 @@ mod integration {
         let fake_verifier = Address::generate(&k.env);
         let sme = Address::generate(&k.env);
 
-        let result = k.risk_registry.try_register_sme(&fake_verifier, &sme, &10u32);
+        let result = k
+            .risk_registry
+            .try_register_sme(&fake_verifier, &sme, &10u32);
         assert!(result.is_err());
     }
 
@@ -386,13 +392,31 @@ mod integration {
             sample_invoice_params(&k.env);
 
         let id1 = k.invoice_nft.mint_invoice(
-            &sme, &debtor_hash, &amount, &currency, &due_date, &ipfs_cid, &risk_score,
+            &sme,
+            &debtor_hash,
+            &amount,
+            &currency,
+            &due_date,
+            &ipfs_cid,
+            &risk_score,
         );
         let id2 = k.invoice_nft.mint_invoice(
-            &sme, &debtor_hash, &amount, &currency, &due_date, &ipfs_cid, &risk_score,
+            &sme,
+            &debtor_hash,
+            &amount,
+            &currency,
+            &due_date,
+            &ipfs_cid,
+            &risk_score,
         );
         let id3 = k.invoice_nft.mint_invoice(
-            &sme, &debtor_hash, &amount, &currency, &due_date, &ipfs_cid, &risk_score,
+            &sme,
+            &debtor_hash,
+            &amount,
+            &currency,
+            &due_date,
+            &ipfs_cid,
+            &risk_score,
         );
 
         assert_eq!(id1, 1);

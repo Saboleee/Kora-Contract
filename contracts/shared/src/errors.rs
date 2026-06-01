@@ -49,8 +49,13 @@ pub enum KoraError {
 
     // General
     ArithmeticOverflow = 90,
-    InvalidAddress = 91,
-    EmptyString = 92,
-    AlreadyInitialized = 93,
-    NotInitialized = 94,
+    ArithmeticUnderflow = 91,
+    InvalidAddress = 92,
+    EmptyString = 93,
+    AlreadyInitialized = 94,
+    NotInitialized = 96,
+    // Distinct error for empty bytes (semantically different from EmptyString)
+    EmptyBytes = 97,
+    // Reentrancy guard triggered
+    Reentrancy = 98,
 }

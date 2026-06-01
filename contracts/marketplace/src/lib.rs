@@ -1,35 +1,49 @@
 #![no_std]
 
-use soroban_sdk::{
-    contract, contractimpl, contracttype, token, Address, Env,
-};
 use kora_shared::{
     errors::KoraError,
     events,
-    types::{Listing},
-    validation::{bps_of, require_non_zero_amount},
+    reentrancy::ReentrancyGuard,
+    types::Listing,
+    validation::{bps_of, require_non_zero_amount, require_valid_fee_bps, safe_add, safe_sub},
 };
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
 
-// ── Storage Keys ─────────────────────────────────────────────────────────────
+s (~30 days in ledgers at ~5s/ledger) ─────────────────────────
+const PERSISTENT_TTL_THRESHOLD: u32 = 518_400;
+const PERSISTENT_TTL_BUMP: u32 = 518_400;
+
+// ── Stora───────────────────────────────────────────────
 
 #[contracttype]
 pub enum DataKey {
+    Config,
     Listing(u64),
-    Admin,
-    InvoiceNft,
-    FinancingPool,
-    Treasury,
-    FeeBps,
     WhitelistedToken(Address),
 }
 
-// ── Contract ──────────────────────────────────────────────────────────────────
+// ── Config st─────────────────────────────────────────────────────────────
 
-#[contract]
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketplaceConfig {
+    pub admin: Address,
+    pub invoice_nft: Address,
+    pub financing_pool: Address,
+    pub treasury: Address,
+    pub fee_bps: u32,
+}
+
+// ── Contr─────────────────────────────
+
+ract]
 pub struct MarketplaceContract;
 
 #[contractimpl]
 impl MarketplaceContract {
+    /// Initialize the marketplace contract. Sets up admin, connected contracts, and fee configuration.
+    /// Parameters: env, admin address, invoice_nft contract address, financing_pool address, treasury address, fee rate in basis points.
+    /// Errors: AlreadyInitialized if already initialized, invalid fee_bps if > 10_000 bps (100%).
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -37,20 +51,97 @@ impl MarketplaceContract {
         financing_pool: Address,
         treasury: Address,
         fee_bps: u32,
-    ) -> Result<(), KoraError> {
-        if env.storage().instance().has(&DataKey::Admin) {
+    ) -> 
+        if env.storage().instance().has(::Config) {
             return Err(KoraError::AlreadyInitialized);
         }
-        kora_shared::validation::require_valid_fee_bps(fee_bps)?;
+        require_valid_fee_bps(fee_bps)?;
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::InvoiceNft, &invoice_nft);
-        env.storage().instance().set(&DataKey::FinancingPool, &financing_pool);
+        env.storage()
+            .instance()
+            .set(&DataKey::InvoiceNft, &invoice_nft);
+        env.storage()
+            .instance()
+            .set(&DataKey::FinancingPool, &financing_pool);
         env.storage().instance().set(&DataKey::Treasury, &treasury);
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
         Ok(())
     }
 
+    /pdate the marketplace fee. Admin only.
+ fee_bps: u32) -> Result<(), KoraError> {
+        admin.require_auth();
+        let mut config = Self::load_config(&env)?;
+        if config.admin != admin {
+            return Err(KoraError::NotAdmin);
+        }
+        require_valid_fee_bps(fee_bps)?;
+
+        let old_bps = config.fee_bps;
+        config.fee_bps = fee_bps;
+        env.storage().instance().set(&DataKey::Config, &config);
+        events::fee_rate_updated(&env, &admin, old_bps, fee_bps);
+        Ok(())
+    }
+
+    /// Returns the current fein basis points.
+    pub fn get_fee_bps(env: Env) -> Result<u32, KoraError> {
+        Ok(Self::load_config(&env)?.fee_bps)
+    }
+
+    /// Returns the full config struct.
+    pub fn get_config(env: Env) -> Result<MarketplaceConfig, KoraError> {
+        Self::load_config(&env)
+    }
+
+    /// Whitelist a stablecoin token for use in listings. Admin only.
+    pub fn whitelist_token(env: Env, admin: Address, token: Address) -> Result<(), KoraError> {
+        aauth();
+
+        if config.admin != admin {
+            return Err(KoraError::NotAdmin);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::WhitelistedToken(token.clone()), &true);
+        Self::bump_persistent(&env, &DataKey::WhitelistedToken(token.clone()));
+        events::token_whitelisted(&env, &token);
+        Ok(())
+    }
+
+    /// Remove a token from the whitelist. Admin only.
+    pub fn remove_token_whitelist(
+        env: Env,
+        admin: Address,
+        token: Address,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        let coad_config(&env)?;
+        if config.admin != admin {
+ror::NotAdmin);
+        }
+        if !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::WhitelistedToken(token.clone()))
+            .unwrap_or(false)
+        {
+            return Err(KoraError::TokenNotWhitelisted);
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::WhitelistedToken(token));
+        Ok(())
+    }
+
     /// SME lists an invoice NFT for financing.
+    ///
+    /// Invariants enforced:
+    /// -face_value` > 0
+    /// - `asking_price` < `face_value` (discount must exist)
+    /// - `funding_deadline` is strictly in the future
+    /// - `token` is whitelisted
+    /// - No existing active listing for this `invoice_id`
     pub fn list_invoice(
         env: Env,
         seller: Address,
@@ -61,24 +152,36 @@ impl MarketplaceContract {
         funding_deadline: u64,
     ) -> Result<(), KoraError> {
         seller.require_auth();
+
+        // ── Input validation ──────────────────────────────────────────────────
         require_non_zero_amount(asking_price)?;
-        require_non_zero_amount(face_value)?;
+alue)?;
         kora_shared::validation::require_future_timestamp(&env, funding_deadline)?;
 
         if asking_price >= face_value {
-            return Err(KoraError::InvalidAmount); // discount must exist
+            return Err(KoraError::InvalidAmount);
         }
         Self::require_whitelisted_token(&env, &token)?;
 
-        if env.storage().persistent().has(&DataKey::Listing(invoice_id)) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Listing(invoice_id))
+        {
             return Err(KoraError::InvoiceAlreadyExists);
         }
 
-        // Notify Invoice NFT contract to transition status
-        let nft_contract: Address = env.storage().instance().get(&DataKey::InvoiceNft).unwrap();
-        let nft_client = kora_invoice_nft::InvoiceNftContractClient::new(&env, &nft_contract);
+        // ── Reentrancy guard ──────────────────────────────────────────────────
+        let _guard = Reent:new(&env)?;
+
+        let config = Self::load_config(&env)?;
+
+        // ── Cross-contract: transition NFT to Listed ──────────────────────────
+        let nft_client =
+            kora_invoice_nft::InvoiceNftContractClient::new(&env, &config.invoice_nft);
         nft_client.set_listed(&env.current_contract_address(), &invoice_id);
 
+        // ── Effects ───────────────────────────────────────────────────────────
         let listing = Listing {
             invoice_id,
             seller: seller.clone(),
@@ -89,12 +192,17 @@ impl MarketplaceContract {
             funding_deadline,
             is_active: true,
         };
-        env.storage().persistent().set(&DataKey::Listing(invoice_id), &listing);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Listing(invoice_id), &listing);
         events::invoice_listed(&env, invoice_id, &seller, asking_price);
         Ok(())
     }
 
-    /// Investor funds a share of the invoice.
+    /// Investor funds a share of an invoice. Deducts marketplace fee (bps_of(amount, fee_bps)) and transfers net to pool.
+    /// Fee goes to treasury, net goes to financing_pool. When fully funded, releases funds to SME and transitions invoice to Funded.
+    /// Parameters: investor address, invoice_id, amount to contribute.
+    /// Errors: ListingNotFound, ListingAlreadyCancelled, FundingDeadlinePassed, InvalidAmount if <= 0, ExceedsFundingTarget, ArithmeticOverflow.
     pub fn fund_invoice(
         env: Env,
         investor: Address,
@@ -102,8 +210,11 @@ impl MarketplaceContract {
         amount: i128,
     ) -> Result<(), KoraError> {
         investor.require_auth();
-        require_non_zero_amount(amount)?;
 
+        // ── Input validation ──────────────────────────────────────────────────
+_amount(amount)?;
+
+        // ── Load and validate listing ─────────────────────────────────────────
         let mut listing: Listing = env
             .storage()
             .persistent()
@@ -117,54 +228,62 @@ impl MarketplaceContract {
             return Err(KoraError::FundingDeadlinePassed);
         }
 
-        let remaining = listing.asking_price
-            .checked_sub(listing.funded_amount)
-            .ok_or(KoraError::ArithmeticOverflow)?;
-
+        let remaining = safe_sub(listing.askinnded_amount)?;
         if amount > remaining {
-            return Err(KoraError::ExceedsFundingTarget);
+turn Err(KoraError::ExceedsFundingTarget);
         }
 
-        // Collect marketplace fee from investor
+        // Collect marketplace fee from investor (on top of contribution)
         let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(50);
         let fee = bps_of(amount, fee_bps)?;
-        let net = amount.checked_sub(fee).ok_or(KoraError::ArithmeticOverflow)?;
-
-        let token_client = token::Client::new(&env, &listing.token);
-        let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
-
-        // Transfer fee to treasury
-        token_client.transfer(&investor, &treasury, &fee);
-        // Transfer net to financing pool
-        let pool_contract: Address = env.storage().instance().get(&DataKey::FinancingPool).unwrap();
-        token_client.transfer(&investor, &pool_contract, &net);
-
-        listing.funded_amount = listing
-            .funded_amount
-            .checked_add(amount)
+        let net = amount
+            .checked_sub(fee)
             .ok_or(KoraError::ArithmeticOverflow)?;
 
-        let fully_funded = listing.funded_amount >= listing.asking_price;
+        let token_client = token::Client::new(&env, &listing.token);
+
+        // ── Interact────────────────
+        // Transfer fee to treasury (if non-zero)
+        if fee > 0 {
+            token_client.transfer(&investor, &config.treasury, &fee);
+        }
+        // Transfer full contribution amount to financing pool
+        token_client.transfer(&investor, &config.financing_pool, &amount);
+
+        // ── Effects: update state after transfers ─────────────────────────────
+        listing.funded_amount = safe_add(listing.funded_amount, amount)?;
+
+        let fully_funded = listing.funded_amoing.asking_price;
         if fully_funded {
             listing.is_active = false;
         }
 
-        env.storage().persistent().set(&DataKey::Listing(invoice_id), &listing);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Listing(invoice_id), &listing);
         events::invoice_funded(&env, invoice_id, &investor, amount);
-        events::fee_collected(&env, invoice_id, fee, &listing.token);
+        if fee > 0 {
+            events::fee_collected(&env, invoice_id, fee, &listing.token);
+        }
 
-        // If fully funded, notify pool to release funds to SME
+        // ── Cross-contract: notify pool to release funds to SME ───────────────
         if fully_funded {
-            let pool_client = kora_financing_pool::FinancingPoolContractClient::new(&env, &pool_contract);
+            let pool_client = kora_financing_potClient::new(
+                &env,
+                &confipool,
+            );
             pool_client.release_funds(&env.current_contract_address(), &invoice_id);
         }
 
         Ok(())
     }
 
-    /// SME or admin cancels a listing before it is fully funded.
+    /// Cancel a listing before it is fully funded. Caller must be seller or admin.
+    /// Parameters: caller address, invoice_id to cancel.
+    /// Errors: ListingNotFound, ListingAlreadyCancelled, Unauthorized if caller is neither seller nor admin.
     pub fn cancel_listing(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
         caller.require_auth();
+
         let mut listing: Listing = env
             .storage()
             .persistent()
@@ -175,25 +294,32 @@ impl MarketplaceContract {
             return Err(KoraError::ListingAlreadyCancelled);
         }
 
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if caller != listing.seller && caller != admin {
+        let config = Self::load_config(&env)?;
+        if caller != listing.seller && caller != config.admin {
             return Err(KoraError::Unauthorized);
         }
 
         listing.is_active = false;
-        env.storage().persistent().set(&DataKey::Listing(invoice_id), &listing);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Listing(invoice_id), &listing);
         events::listing_cancelled(&env, invoice_id, &listing.seller);
         Ok(())
     }
 
-    /// Whitelist a stablecoin token for use in listings.
-    pub fn whitelist_token(env: Env, admin: Address, token: Address) -> Result<(), KoraError> {
-        admin.require_auth();
-        Self::require_admin(&env, &admin)?;
-        env.storage().persistent().set(&DataKey::WhitelistedToken(token), &true);
+        // ── Effects ───────────────────────────────────────────────────────────
+        listing.is_active = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Listing(invoice_id), &listing);
+        Self::bump_persistent(&env, &DataKey::Listing(invoice_id));
+
+        events::listing_cancelled(&env, invoice_id, &listing.seller);
         Ok(())
     }
 
+    /// Get a listing by invoice_id. Returns the full Listing struct including status and funded_amount.
+    /// Errors: ListingNotFound if no listing exists for this invoice_id.
     pub fn get_listing(env: Env, invoice_id: u64) -> Result<Listing, KoraError> {
         env.storage()
             .persistent()
@@ -201,7 +327,22 @@ impl MarketplaceContract {
             .ok_or(KoraError::ListingNotFound)
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    /// Returns whether a token is whitelisted.
+    pub fn is_token_whitelisted(env: Env, token: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::WhitelistedToken(token))
+            .unwrap_or(false)
+    }
+
+    /rivate helpers ───────────────────────────────────────────────────────
+
+    fn load_config(env: &Env) -> Result<MarketplaceConfig, KoraError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(KoraError::NotInitialized)
+    }
 
     fn require_whitelisted_token(env: &Env, token: &Address) -> Result<(), KoraError> {
         let ok: bool = env
@@ -216,15 +357,54 @@ impl MarketplaceContract {
     }
 
     fn require_admin(env: &Env, caller: &Address) -> Result<(), KoraError> {
+        let config = Self::load_config(env)?;
+        if &config.admin != caller {
+            return Err(KoraError::NotAdmin);
+        }
+        Ok(())
+    }
+
+    fn load_config(env: &Env) -> Result<MarketplaceConfig, KoraError> {
+        if let Some(config) = env.storage().instance().get(&DataKey::Config) {
+            return Ok(config);
+        }
+
+        // Legacy migration path: read individual keys and persist a consolidated config.
         let admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
             .ok_or(KoraError::NotInitialized)?;
-        if &admin != caller {
-            return Err(KoraError::NotAdmin);
-        }
-        Ok(())
+        let invoice_nft: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::InvoiceNft)
+            .ok_or(KoraError::NotInitialized)?;
+        let financing_pool: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::FinancingPool)
+            .ok_or(KoraError::NotInitialized)?;
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Treasury)
+            .ok_or(KoraError::NotInitialized)?;
+        let fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeBps)
+            .ok_or(KoraError::NotInitialized)?;
+
+        let config = MarketplaceConfig {
+            admin,
+            invoice_nft,
+            financing_pool,
+            treasury,
+            fee_bps,
+        };
+        env.storage().instance().set(&DataKey::Config, &config);
+        Ok(config)
     }
 }
 
@@ -250,6 +430,8 @@ mod tests {
         admin: Address,
         token: Address,
         seller: Address,
+        treasury: Address,
+        pool: Address,
         mp: MarketplaceContractClient<'static>,
         nft: InvoiceNftContractClient<'static>,
     }
@@ -294,7 +476,7 @@ mod tests {
 
         let seller = Address::generate(&env);
 
-        TestEnv { env, admin, token, seller, mp, nft }
+        TestEnv { env, admin, token, seller, treasury, pool: pool_id, mp, nft }
     }
 
     /// Convenience: list an invoice with standard params, returns invoice_id=1.
@@ -319,7 +501,12 @@ mod tests {
         // Whitelist worked — listing with the token should not fail on token check
         let deadline = t.env.ledger().timestamp() + 86_400;
         let result = t.mp.try_list_invoice(
-            &t.seller, &1u64, &9_000i128, &10_000i128, &t.token, &deadline,
+            &t.seller,
+            &1u64,
+            &9_000i128,
+            &10_000i128,
+            &t.token,
+            &deadline,
         );
         // May fail on nft cross-call but NOT on TokenNotWhitelisted
         if let Err(Ok(e)) = result {
@@ -356,6 +543,47 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn test_get_config_returns_initialized_values() {
+        let t = deploy();
+        let config = t.mp.get_config();
+        assert_eq!(config.admin, t.admin);
+        assert_eq!(config.invoice_nft, t.nft.address);
+        assert_eq!(config.financing_pool, t.pool);
+        assert_eq!(config.treasury, t.treasury);
+        assert_eq!(config.fee_bps, 50u32);
+    }
+
+    #[test]
+    fn test_legacy_state_migrates_to_config() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let nft_id = env.register_contract(None, InvoiceNftContract);
+        let pool_id = env.register_contract(None, FinancingPoolContract);
+        let mp_id = env.register_contract(None, MarketplaceContract);
+        let mp = MarketplaceContractClient::new(&env, &mp_id);
+
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::InvoiceNft, &nft_id);
+        env.storage().instance().set(&DataKey::FinancingPool, &pool_id);
+        env.storage().instance().set(&DataKey::Treasury, &treasury);
+        env.storage().instance().set(&DataKey::FeeBps, &75u32);
+
+        let migrated = mp.get_config();
+        assert_eq!(migrated.admin, admin);
+        assert_eq!(migrated.invoice_nft, nft_id);
+        assert_eq!(migrated.financing_pool, pool_id);
+        assert_eq!(migrated.treasury, treasury);
+        assert_eq!(migrated.fee_bps, 75u32);
+
+        // Config should be persisted after fallback migration.
+        let reloaded = mp.get_config();
+        assert_eq!(reloaded, migrated);
+    }
+
     // ── whitelist_token ───────────────────────────────────────────────────────
 
     #[test]
@@ -384,9 +612,8 @@ mod tests {
         // Both tokens should now be accepted (no error on token check)
         let deadline = t.env.ledger().timestamp() + 86_400;
         for tok in [&t2, &t3] {
-            let r = t.mp.try_list_invoice(
-                &t.seller, &99u64, &9_000i128, &10_000i128, tok, &deadline,
-            );
+            let r =
+                t.mp.try_list_invoice(&t.seller, &99u64, &9_000i128, &10_000i128, tok, &deadline);
             if let Err(Ok(e)) = r {
                 assert_ne!(e, KoraError::TokenNotWhitelisted);
             }
@@ -399,7 +626,7 @@ mod tests {
     fn test_list_invoice_success() {
         let t = deploy();
         let id = list_one(&t);
-        let listing = t.mp.get_listing(&id).unwrap();
+        let listing = t.mp.get_listing(&id);
         assert_eq!(listing.invoice_id, 1);
         assert_eq!(listing.seller, t.seller);
         assert_eq!(listing.asking_price, 9_500_000_000i128);
@@ -422,7 +649,12 @@ mod tests {
         let bad_token = Address::generate(&t.env);
         let deadline = t.env.ledger().timestamp() + 86_400;
         let result = t.mp.try_list_invoice(
-            &t.seller, &1u64, &9_000i128, &10_000i128, &bad_token, &deadline,
+            &t.seller,
+            &1u64,
+            &9_000i128,
+            &10_000i128,
+            &bad_token,
+            &deadline,
         );
         assert_eq!(result.unwrap_err().unwrap(), KoraError::TokenNotWhitelisted);
     }
@@ -431,9 +663,8 @@ mod tests {
     fn test_list_invoice_zero_asking_price_rejected() {
         let t = deploy();
         let deadline = t.env.ledger().timestamp() + 86_400;
-        let result = t.mp.try_list_invoice(
-            &t.seller, &1u64, &0i128, &10_000i128, &t.token, &deadline,
-        );
+        let result =
+            t.mp.try_list_invoice(&t.seller, &1u64, &0i128, &10_000i128, &t.token, &deadline);
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
     }
 
@@ -441,9 +672,8 @@ mod tests {
     fn test_list_invoice_zero_face_value_rejected() {
         let t = deploy();
         let deadline = t.env.ledger().timestamp() + 86_400;
-        let result = t.mp.try_list_invoice(
-            &t.seller, &1u64, &9_000i128, &0i128, &t.token, &deadline,
-        );
+        let result =
+            t.mp.try_list_invoice(&t.seller, &1u64, &9_000i128, &0i128, &t.token, &deadline);
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
     }
 
@@ -452,7 +682,12 @@ mod tests {
         let t = deploy();
         let deadline = t.env.ledger().timestamp() + 86_400;
         let result = t.mp.try_list_invoice(
-            &t.seller, &1u64, &10_000i128, &10_000i128, &t.token, &deadline,
+            &t.seller,
+            &1u64,
+            &10_000i128,
+            &10_000i128,
+            &t.token,
+            &deadline,
         );
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
     }
@@ -462,7 +697,12 @@ mod tests {
         let t = deploy();
         let deadline = t.env.ledger().timestamp() + 86_400;
         let result = t.mp.try_list_invoice(
-            &t.seller, &1u64, &11_000i128, &10_000i128, &t.token, &deadline,
+            &t.seller,
+            &1u64,
+            &11_000i128,
+            &10_000i128,
+            &t.token,
+            &deadline,
         );
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
     }
@@ -471,9 +711,8 @@ mod tests {
     fn test_list_invoice_past_deadline_rejected() {
         let t = deploy();
         let past = t.env.ledger().timestamp() - 1;
-        let result = t.mp.try_list_invoice(
-            &t.seller, &1u64, &9_000i128, &10_000i128, &t.token, &past,
-        );
+        let result =
+            t.mp.try_list_invoice(&t.seller, &1u64, &9_000i128, &10_000i128, &t.token, &past);
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidDueDate);
     }
 
@@ -483,18 +722,25 @@ mod tests {
         list_one(&t);
         let deadline = t.env.ledger().timestamp() + 86_400;
         let result = t.mp.try_list_invoice(
-            &t.seller, &1u64, &9_000i128, &10_000i128, &t.token, &deadline,
+            &t.seller,
+            &1u64,
+            &9_000i128,
+            &10_000i128,
+            &t.token,
+            &deadline,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvoiceAlreadyExists);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            KoraError::InvoiceAlreadyExists
+        );
     }
 
     #[test]
     fn test_list_invoice_negative_asking_price_rejected() {
         let t = deploy();
         let deadline = t.env.ledger().timestamp() + 86_400;
-        let result = t.mp.try_list_invoice(
-            &t.seller, &1u64, &-1i128, &10_000i128, &t.token, &deadline,
-        );
+        let result =
+            t.mp.try_list_invoice(&t.seller, &1u64, &-1i128, &10_000i128, &t.token, &deadline);
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
     }
 
@@ -512,10 +758,14 @@ mod tests {
         let t = deploy();
         let deadline = t.env.ledger().timestamp() + 86_400 * 30;
         t.mp.list_invoice(
-            &t.seller, &1u64, &9_500_000_000i128, &10_000_000_000i128,
-            &t.token, &deadline,
+            &t.seller,
+            &1u64,
+            &9_500_000_000i128,
+            &10_000_000_000i128,
+            &t.token,
+            &deadline,
         );
-        let listing = t.mp.get_listing(&1u64).unwrap();
+        let listing = t.mp.get_listing(&1u64);
         assert_eq!(listing.asking_price, 9_500_000_000i128);
         assert_eq!(listing.face_value, 10_000_000_000i128);
         assert_eq!(listing.funding_deadline, deadline);
@@ -549,7 +799,10 @@ mod tests {
         let investor = Address::generate(&t.env);
         // asking_price is 9_500_000_000 — fund 1 more than that
         let result = t.mp.try_fund_invoice(&investor, &1u64, &9_500_000_001i128);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::ExceedsFundingTarget);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            KoraError::ExceedsFundingTarget
+        );
     }
 
     #[test]
@@ -557,8 +810,12 @@ mod tests {
         let t = deploy();
         let deadline = t.env.ledger().timestamp() + 100;
         t.mp.list_invoice(
-            &t.seller, &1u64, &9_500_000_000i128, &10_000_000_000i128,
-            &t.token, &deadline,
+            &t.seller,
+            &1u64,
+            &9_500_000_000i128,
+            &10_000_000_000i128,
+            &t.token,
+            &deadline,
         );
         // Advance past deadline
         t.env.ledger().set(LedgerInfo {
@@ -573,7 +830,10 @@ mod tests {
         });
         let investor = Address::generate(&t.env);
         let result = t.mp.try_fund_invoice(&investor, &1u64, &1_000_000i128);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::FundingDeadlinePassed);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            KoraError::FundingDeadlinePassed
+        );
     }
 
     #[test]
@@ -583,7 +843,10 @@ mod tests {
         t.mp.cancel_listing(&t.seller, &1u64);
         let investor = Address::generate(&t.env);
         let result = t.mp.try_fund_invoice(&investor, &1u64, &1_000_000i128);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::ListingAlreadyCancelled);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            KoraError::ListingAlreadyCancelled
+        );
     }
 
     #[test]
@@ -593,7 +856,7 @@ mod tests {
         let investor = Address::generate(&t.env);
         // Partial fund — token transfer will be mocked
         t.mp.fund_invoice(&investor, &1u64, &1_000_000_000i128);
-        let listing = t.mp.get_listing(&1u64).unwrap();
+        let listing = t.mp.get_listing(&1u64);
         assert_eq!(listing.funded_amount, 1_000_000_000i128);
         assert!(listing.is_active); // not yet fully funded
     }
@@ -609,7 +872,7 @@ mod tests {
         let investor = Address::generate(&t.env);
         let amount = 10_000_000i128;
         t.mp.fund_invoice(&investor, &1u64, &amount);
-        let listing = t.mp.get_listing(&1u64).unwrap();
+        let listing = t.mp.get_listing(&1u64);
         assert_eq!(listing.funded_amount, amount);
     }
 
@@ -621,7 +884,7 @@ mod tests {
         let inv2 = Address::generate(&t.env);
         t.mp.fund_invoice(&inv1, &1u64, &4_000_000_000i128);
         t.mp.fund_invoice(&inv2, &1u64, &4_000_000_000i128);
-        let listing = t.mp.get_listing(&1u64).unwrap();
+        let listing = t.mp.get_listing(&1u64);
         assert_eq!(listing.funded_amount, 8_000_000_000i128);
         assert!(listing.is_active);
     }
@@ -633,7 +896,7 @@ mod tests {
         let investor = Address::generate(&t.env);
         // Fund the full asking price in one go
         t.mp.fund_invoice(&investor, &1u64, &9_500_000_000i128);
-        let listing = t.mp.get_listing(&1u64).unwrap();
+        let listing = t.mp.get_listing(&1u64);
         assert!(!listing.is_active);
         assert_eq!(listing.funded_amount, 9_500_000_000i128);
     }
@@ -645,7 +908,7 @@ mod tests {
         let t = deploy();
         list_one(&t);
         assert!(t.mp.try_cancel_listing(&t.seller, &1u64).is_ok());
-        let listing = t.mp.get_listing(&1u64).unwrap();
+        let listing = t.mp.get_listing(&1u64);
         assert!(!listing.is_active);
     }
 
@@ -654,7 +917,7 @@ mod tests {
         let t = deploy();
         list_one(&t);
         assert!(t.mp.try_cancel_listing(&t.admin, &1u64).is_ok());
-        let listing = t.mp.get_listing(&1u64).unwrap();
+        let listing = t.mp.get_listing(&1u64);
         assert!(!listing.is_active);
     }
 
@@ -680,7 +943,10 @@ mod tests {
         list_one(&t);
         t.mp.cancel_listing(&t.seller, &1u64);
         let result = t.mp.try_cancel_listing(&t.seller, &1u64);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::ListingAlreadyCancelled);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            KoraError::ListingAlreadyCancelled
+        );
     }
 
     #[test]
@@ -690,7 +956,7 @@ mod tests {
         let stranger = Address::generate(&t.env);
         let _ = t.mp.try_cancel_listing(&stranger, &1u64);
         // Listing must still be active
-        let listing = t.mp.get_listing(&1u64).unwrap();
+        let listing = t.mp.get_listing(&1u64);
         assert!(listing.is_active);
     }
 
@@ -701,6 +967,25 @@ mod tests {
         t.mp.cancel_listing(&t.admin, &1u64);
         let investor = Address::generate(&t.env);
         let result = t.mp.try_fund_invoice(&investor, &1u64, &1_000_000i128);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::ListingAlreadyCancelled);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            KoraError::ListingAlreadyCancelled
+        );
+    }
+
+    #[test]
+    fn test_fund_cancelled_listing() {
+        let (env, admin, _nft, _pool, _treasury, client) = setup();
+        let seller = Address::generate(&env);
+        let investor = Address::generate(&env);
+        let token = Address::generate(&env);
+        client.whitelist_token(&admin, &token);
+        let deadline = env.ledger().timestamp() + 1_000_000u64;
+        client.list_invoice(
+            &seller, &1u64, &9_500_000_000i128, &10_000_000_000i128, &token, &deadline,
+        );
+        client.cancel_listing(&seller, &1u64);
+        let result = client.try_fund_invoice(&investor, &1u64, &1_000_000_000i128);
+        assert!(result.is_err());
     }
 }

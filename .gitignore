@@ -3,3 +3,8 @@ target/
 *.wasm
 .env
 .env.*
+test_snapshots/
+**/test_snapshots/
+issues.md
+generate_issues.py
+waves-issues.md
