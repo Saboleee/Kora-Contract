@@ -1,4 +1,5 @@
 #![no_std]
+// Added standardized events
 
 //! # Invoice NFT Contract
 //!
@@ -59,6 +60,7 @@ pub enum DataKey {
     /// Instance key: current schema migration version (starts at 1)
     MigrationVersion,
 }
+
 
 // ── Contract ─────────────────────────────────────────────────────────────────
 
@@ -163,6 +165,14 @@ impl InvoiceNftContract {
     }
 
     /// Transition invoice to Listed status. Called by Marketplace contract.
+    ///
+    /// **Parameters:**
+    /// - `caller` — The marketplace contract address.
+    /// - `invoice_id` — The ID of the invoice to list.
+    ///
+    /// **Returns:** `Ok(())` on success, or an appropriate `KoraError`.
+    ///
+    /// **Security:** Requires auth from the caller. Validates that the invoice is in `Created` status.
     pub fn set_listed(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
         caller.require_auth();
         Self::require_not_paused(&env)?;
@@ -180,6 +190,14 @@ impl InvoiceNftContract {
     }
 
     /// Transition invoice to Funded. Called by Financing Pool contract.
+    ///
+    /// **Parameters:**
+    /// - `caller` — The investor or financing pool contract address.
+    /// - `invoice_id` — The ID of the invoice to fund.
+    ///
+    /// **Returns:** `Ok(())` on success, or an appropriate `KoraError`.
+    ///
+    /// **Security:** Requires auth from the caller. Validates that the invoice is in `Listed` status.
     pub fn set_funded(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
         caller.require_auth();
         Self::require_not_paused(&env)?;
@@ -192,11 +210,19 @@ impl InvoiceNftContract {
         env.storage()
             .persistent()
             .set(&DataKey::Invoice(invoice_id), &invoice);
-        events::invoice_funded(&env, invoice_id, &invoice.sme, invoice.amount);
+        events::invoice_funded(&env, invoice_id, &caller, invoice.amount);
         Ok(())
     }
 
     /// Mark invoice as Repaid. Called by Financing Pool on full repayment.
+    ///
+    /// **Parameters:**
+    /// - `caller` — The financing pool contract address.
+    /// - `invoice_id` — The ID of the invoice to repay.
+    ///
+    /// **Returns:** `Ok(())` on success, or an appropriate `KoraError`.
+    ///
+    /// **Security:** Requires auth from the caller. Validates that the invoice is in `Funded` status.
     pub fn set_repaid(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
         caller.require_auth();
         Self::require_not_paused(&env)?;
@@ -214,6 +240,14 @@ impl InvoiceNftContract {
     }
 
     /// Mark invoice as Defaulted. Called by admin after due date passes.
+    ///
+    /// **Parameters:**
+    /// - `caller` — The admin address.
+    /// - `invoice_id` — The ID of the invoice to mark as defaulted.
+    ///
+    /// **Returns:** `Ok(())` on success, or an appropriate `KoraError`.
+    ///
+    /// **Security:** Requires admin auth. Validates that the invoice is `Funded` and the due date has passed.
     pub fn set_defaulted(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
         caller.require_auth();
         Self::require_admin(&env, &caller)?;
@@ -262,7 +296,11 @@ impl InvoiceNftContract {
 
     /// Returns the number of invoices minted (next_id - 1).
     pub fn invoice_count(env: Env) -> u64 {
-        env.storage().instance().get::<_, u64>(&DataKey::NextId).unwrap_or(1).saturating_sub(1)
+        env.storage()
+            .instance()
+            .get::<_, u64>(&DataKey::NextId)
+            .unwrap_or(1)
+            .saturating_sub(1)
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
@@ -434,7 +472,10 @@ mod tests {
         let (env, _admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+        let ipfs_cid = String::from_str(
+            &env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
         let due_date = env.ledger().timestamp() + 86_400;
         let result = client.try_mint_invoice(
             &sme, &debtor_hash, &0i128,
@@ -448,7 +489,10 @@ mod tests {
         let (env, _admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+        let ipfs_cid = String::from_str(
+            &env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
         let due_date = env.ledger().timestamp() + 86_400;
         let result = client.try_mint_invoice(
             &sme, &debtor_hash, &-1_000_000_000i128,
@@ -462,7 +506,10 @@ mod tests {
         let (env, _admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+        let ipfs_cid = String::from_str(
+            &env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
         let due_date = env.ledger().timestamp() - 1;
 
         let result = client.try_mint_invoice(
@@ -477,7 +524,10 @@ mod tests {
         let (env, _admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
-        let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+        let ipfs_cid = String::from_str(
+            &env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
         let due_date = env.ledger().timestamp() + 86_400;
 
         let result = client.try_mint_invoice(
@@ -492,7 +542,10 @@ mod tests {
         let (env, _admin, client) = setup();
         let sme = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[]);
-        let ipfs_cid = String::from_str(&env, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+        let ipfs_cid = String::from_str(
+            &env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
         let due_date = env.ledger().timestamp() + 86_400;
         let result = client.try_mint_invoice(
             &sme, &debtor_hash, &1_000_000_000i128,

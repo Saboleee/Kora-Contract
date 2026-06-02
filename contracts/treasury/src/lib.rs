@@ -175,7 +175,6 @@ impl TreasuryContract {
         Self::require_admin(&env, &admin)?;
         Self::require_whitelisted_token(&env, &token)?;
 
-        // Acquire reentrancy guard — released automatically when _guard drops
         let _guard = ReentrancyGuard::new(&env)?;
 
         let token_client = token::Client::new(&env, &token);
@@ -183,6 +182,7 @@ impl TreasuryContract {
 
         // ── Interactions ──────────────────────────────────────────────────────
         if balance > 0 {
+            // ── Interactions ──────────────────────────────────────────────────────
             token_client.transfer(&env.current_contract_address(), &recipient, &balance);
             events::emergency_withdrawn(&env, &admin, &token, balance);
         }
@@ -258,7 +258,7 @@ mod tests {
         let contract_id = env.register_contract(None, TreasuryContract);
         let client = TreasuryContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
-        client.initialize(&admin, &50u32).unwrap();
+        client.initialize(&admin, &50u32);
         (env, admin, client)
     }
 
@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn test_set_fee_bps_success() {
         let (_env, admin, client) = setup();
-        client.set_fee_bps(&admin, &100u32).unwrap();
+        client.set_fee_bps(&admin, &100u32);
         assert_eq!(client.get_fee_bps(), 100);
     }
 
@@ -321,14 +321,14 @@ mod tests {
     #[test]
     fn test_set_fee_bps_zero_allowed() {
         let (_env, admin, client) = setup();
-        client.set_fee_bps(&admin, &0u32).unwrap();
+        client.set_fee_bps(&admin, &0u32);
         assert_eq!(client.get_fee_bps(), 0);
     }
 
     #[test]
     fn test_set_fee_bps_max_allowed() {
         let (_env, admin, client) = setup();
-        client.set_fee_bps(&admin, &10_000u32).unwrap();
+        client.set_fee_bps(&admin, &10_000u32);
         assert_eq!(client.get_fee_bps(), 10_000);
     }
 
@@ -341,11 +341,11 @@ mod tests {
     #[test]
     fn test_set_fee_bps_multiple_updates() {
         let (_env, admin, client) = setup();
-        client.set_fee_bps(&admin, &100u32).unwrap();
+        client.set_fee_bps(&admin, &100u32);
         assert_eq!(client.get_fee_bps(), 100);
-        client.set_fee_bps(&admin, &200u32).unwrap();
+        client.set_fee_bps(&admin, &200u32);
         assert_eq!(client.get_fee_bps(), 200);
-        client.set_fee_bps(&admin, &50u32).unwrap();
+        client.set_fee_bps(&admin, &50u32);
         assert_eq!(client.get_fee_bps(), 50);
     }
 
@@ -357,7 +357,9 @@ mod tests {
         let non_admin = Address::generate(&env);
         let token = Address::generate(&env);
         let recipient = Address::generate(&env);
-        assert!(client.try_withdraw(&non_admin, &token, &recipient, &1_000_000i128).is_err());
+        assert!(client
+            .try_withdraw(&non_admin, &token, &recipient, &1_000_000i128)
+            .is_err());
     }
 
     #[test]
@@ -365,7 +367,9 @@ mod tests {
         let (env, admin, client) = setup();
         let token = Address::generate(&env);
         let recipient = Address::generate(&env);
-        assert!(client.try_withdraw(&admin, &token, &recipient, &0i128).is_err());
+        assert!(client
+            .try_withdraw(&admin, &token, &recipient, &0i128)
+            .is_err());
     }
 
     #[test]
@@ -373,7 +377,9 @@ mod tests {
         let (env, admin, client) = setup();
         let token = Address::generate(&env);
         let recipient = Address::generate(&env);
-        assert!(client.try_withdraw(&admin, &token, &recipient, &-1_000i128).is_err());
+        assert!(client
+            .try_withdraw(&admin, &token, &recipient, &-1_000i128)
+            .is_err());
     }
 
     #[test]
@@ -382,7 +388,9 @@ mod tests {
         let non_admin = Address::generate(&env);
         let token = Address::generate(&env);
         let recipient = Address::generate(&env);
-        assert!(client.try_emergency_withdraw(&non_admin, &token, &recipient).is_err());
+        assert!(client
+            .try_emergency_withdraw(&non_admin, &token, &recipient)
+            .is_err());
     }
 
     #[test]

@@ -28,36 +28,8 @@ pub fn is_locked(env: &Env) -> bool {
     env.storage().instance().has(&GuardKey::Lock)
 }
 
-// ── RAII guard ────────────────────────────────────────────────────────────────
-
-/// RAII reentrancy guard. Acquires the lock on construction and releases it
-/// automatically when dropped.
-///
-/// # Usage
-/// ```rust,ignore
-/// let _guard = ReentrancyGuard::new(&env)?;
-/// // ... protected logic ...
-/// // lock released automatically when _guard goes out of scope
-/// ```
-pub struct ReentrancyGuard<'a> {
-    env: &'a Env,
-}
-
-impl<'a> ReentrancyGuard<'a> {
-    /// Acquire the lock. Returns `KoraError::Reentrancy` if already locked.
-    pub fn new(env: &'a Env) -> Result<Self, KoraError> {
-        acquire_guard(env)?;
-        Ok(Self { env })
-    }
-}
-
-impl<'a> Drop for ReentrancyGuard<'a> {
-    fn drop(&mut self) {
-        release_guard(self.env);
-    }
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
 
 #[cfg(test)]
 mod tests {
@@ -75,7 +47,8 @@ mod tests {
     fn test_acquire_fails_when_locked() {
         let env = Env::default();
         acquire_guard(&env).unwrap();
-        assert_eq!(acquire_guard(&env).unwrap_err(), KoraError::Reentrancy);
+        let result = acquire_guard(&env);
+        assert_eq!(result.err().unwrap(), KoraError::Reentrancy);
         release_guard(&env);
     }
 
@@ -96,6 +69,15 @@ mod tests {
         assert!(is_locked(&env));
         release_guard(&env);
         assert!(!is_locked(&env));
+    }
+
+    #[test]
+    fn test_double_acquire_returns_reentrancy_error() {
+        let env = Env::default();
+        acquire_guard(&env).unwrap();
+        let err = acquire_guard(&env).err().unwrap();
+        assert_eq!(err, KoraError::Reentrancy);
+        release_guard(&env);
     }
 
     #[test]
@@ -149,7 +131,7 @@ mod tests {
         let env = Env::default();
         let _guard = ReentrancyGuard::new(&env).unwrap();
         let result = ReentrancyGuard::new(&env);
-        assert_eq!(result.unwrap_err(), KoraError::Reentrancy);
+        assert_eq!(result.err().unwrap(), KoraError::Reentrancy);
         // First guard drops here, lock released
     }
 }

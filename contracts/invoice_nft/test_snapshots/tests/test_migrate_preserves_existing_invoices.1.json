@@ -285,18 +285,6 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "InvoiceCount"
-                            }
-                          ]
-                        },
-                        "val": {
-                          "u64": 1
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
                               "symbol": "MigrationVersion"
                             }
                           ]
