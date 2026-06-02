@@ -121,6 +121,34 @@ pub fn safe_div(a: i128, b: i128) -> Result<i128, KoraError> {
     a.checked_div(b).ok_or(KoraError::ArithmeticOverflow)
 }
 
+// ── TTL helpers ──────────────────────────────────────────────────────────────
+
+/// Default TTL threshold in ledgers (~30 days at ~5s/ledger).
+pub const DEFAULT_TTL_THRESHOLD: u32 = 518_400;
+
+/// Default TTL bump amount in ledgers (~30 days at ~5s/ledger).
+pub const DEFAULT_TTL_BUMP: u32 = 518_400;
+
+/// Extend the TTL of a persistent storage entry if it's below the threshold.
+///
+/// This is a helper for contracts to manage their persistent storage TTL.
+/// Call this after writing to persistent storage to ensure the entry
+/// doesn't expire unexpectedly.
+///
+/// # Arguments
+/// * `env` - The Soroban environment
+/// * `key` - The storage key to extend
+/// * `threshold` - The minimum TTL in ledgers before extension is triggered
+/// * `bump` - The amount of ledgers to extend the TTL by
+pub fn extend_persistent_ttl<K: soroban_sdk::IntoVal<Env, soroban_sdk::Val> + soroban_sdk::TryFromVal<Env, soroban_sdk::Val>>(
+    env: &Env,
+    key: &K,
+    threshold: u32,
+    bump: u32,
+) {
+    env.storage().persistent().extend_ttl(key, threshold, bump);
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -254,5 +282,71 @@ mod tests {
     fn test_safe_div() {
         assert_eq!(safe_div(200, 4).unwrap(), 50);
         assert!(safe_div(100, 0).is_err());
+    }
+
+    #[test]
+    fn test_safe_div_by_one() {
+        assert_eq!(safe_div(100, 1).unwrap(), 100);
+    }
+
+    #[test]
+    fn test_safe_div_negative_dividend() {
+        assert_eq!(safe_div(-100, 4).unwrap(), -25);
+    }
+
+    #[test]
+    fn test_safe_add_overflow() {
+        assert!(safe_add(i128::MAX, 1).is_err());
+        assert_eq!(safe_add(i128::MAX, 0).unwrap(), i128::MAX);
+    }
+
+    #[test]
+    fn test_safe_sub_underflow() {
+        let err = safe_sub(i128::MIN, 1).unwrap_err();
+        assert_eq!(err, KoraError::ArithmeticUnderflow);
+    }
+
+    #[test]
+    fn test_safe_mul_zero() {
+        assert_eq!(safe_mul(i128::MAX, 0).unwrap(), 0);
+        assert_eq!(safe_mul(0, i128::MAX).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_bps_of_boundary_values() {
+        // 100% (10_000 bps)
+        assert_eq!(bps_of(1_000_000, 10_000).unwrap(), 1_000_000);
+        // 0%
+        assert_eq!(bps_of(1_000_000, 0).unwrap(), 0);
+        // 1 bps (0.01%)
+        assert_eq!(bps_of(10_000, 1).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_require_amount_within_bounds_zero_max() {
+        assert!(require_amount_within_bounds(0, 0).is_ok());
+        assert!(require_amount_within_bounds(1, 0).is_err());
+        assert!(require_amount_within_bounds(-1, 0).is_err());
+    }
+
+    #[test]
+    fn test_require_valid_bps_range_min_equals_max() {
+        assert!(require_valid_bps_range(50, 50, 50).is_ok());
+        assert!(require_valid_bps_range(49, 50, 50).is_err());
+        assert!(require_valid_bps_range(51, 50, 50).is_err());
+    }
+
+    #[test]
+    fn test_require_valid_fee_bps_boundary() {
+        assert!(require_valid_fee_bps(9_999).is_ok());
+        assert!(require_valid_fee_bps(10_000).is_ok());
+        assert!(require_valid_fee_bps(10_001).is_err());
+    }
+
+    #[test]
+    fn test_require_valid_risk_score_boundary() {
+        assert!(require_valid_risk_score(99).is_ok());
+        assert!(require_valid_risk_score(100).is_ok());
+        assert!(require_valid_risk_score(101).is_err());
     }
 }
