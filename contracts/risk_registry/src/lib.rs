@@ -34,13 +34,15 @@ pub struct RiskRegistryContract;
 impl RiskRegistryContract {
     /// One-time initialization. Sets admin and the authorized invoice_nft address.
     pub fn initialize(env: Env, admin: Address, invoice_nft: Address) -> Result<(), KoraError> {
-        if env.storage().instance().has(&DataKey::Admin) {
+        if env.storage().persistent().has(&DataKey::Admin) {
             return Err(KoraError::AlreadyInitialized);
         }
-        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().persistent().set(&DataKey::Admin, &admin);
+        Self::bump_persistent(&env, &DataKey::Admin);
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::InvoiceNft, &invoice_nft);
+        events::registry_initialized(&env, &admin, &invoice_nft);
         Ok(())
     }
 
@@ -48,7 +50,8 @@ impl RiskRegistryContract {
     pub fn transfer_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().persistent().set(&DataKey::Admin, &new_admin);
+        Self::bump_persistent(&env, &DataKey::Admin);
         events::admin_transferred(&env, &new_admin);
         Ok(())
     }
@@ -271,7 +274,7 @@ impl RiskRegistryContract {
 
     pub fn get_admin(env: Env) -> Result<Address, KoraError> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Admin)
             .ok_or(KoraError::NotInitialized)
     }
@@ -281,7 +284,7 @@ impl RiskRegistryContract {
     fn require_admin(env: &Env, caller: &Address) -> Result<(), KoraError> {
         let admin: Address = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Admin)
             .ok_or(KoraError::NotInitialized)?;
         if &admin != caller {
@@ -305,7 +308,7 @@ impl RiskRegistryContract {
     fn require_invoice_nft(env: &Env, caller: &Address) -> Result<(), KoraError> {
         let invoice_nft: Address = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::InvoiceNft)
             .ok_or(KoraError::NotInitialized)?;
         if &invoice_nft != caller {
@@ -515,7 +518,9 @@ mod tests {
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         client.add_verifier(&admin, &verifier).unwrap();
-        assert!(client.try_update_sme_score(&verifier, &sme, &50u32).is_err());
+        assert!(client
+            .try_update_sme_score(&verifier, &sme, &50u32)
+            .is_err());
     }
 
     #[test]
@@ -525,7 +530,9 @@ mod tests {
         let sme = Address::generate(&env);
         client.add_verifier(&admin, &verifier).unwrap();
         client.register_sme(&verifier, &sme, &35u32).unwrap();
-        assert!(client.try_update_sme_score(&verifier, &sme, &101u32).is_err());
+        assert!(client
+            .try_update_sme_score(&verifier, &sme, &101u32)
+            .is_err());
     }
 
     #[test]
@@ -583,7 +590,9 @@ mod tests {
     fn test_increment_invoice_count_sme_not_registered() {
         let (env, _, invoice_nft, client) = setup();
         let sme = Address::generate(&env);
-        assert!(client.try_increment_invoice_count(&invoice_nft, &sme).is_err());
+        assert!(client
+            .try_increment_invoice_count(&invoice_nft, &sme)
+            .is_err());
     }
 
     // ── record_default ────────────────────────────────────────────────────────
@@ -639,7 +648,9 @@ mod tests {
         let verifier = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[0xABu8; 32]);
         client.add_verifier(&admin, &verifier).unwrap();
-        client.set_debtor_score(&verifier, &debtor_hash, &45u32).unwrap();
+        client
+            .set_debtor_score(&verifier, &debtor_hash, &45u32)
+            .unwrap();
         assert_eq!(client.get_debtor_score(&debtor_hash).unwrap(), 45u32);
     }
 
@@ -649,7 +660,9 @@ mod tests {
         let verifier = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[0xABu8; 32]);
         client.add_verifier(&admin, &verifier).unwrap();
-        assert!(client.try_set_debtor_score(&verifier, &debtor_hash, &101u32).is_err());
+        assert!(client
+            .try_set_debtor_score(&verifier, &debtor_hash, &101u32)
+            .is_err());
     }
 
     #[test]
@@ -658,7 +671,9 @@ mod tests {
         let verifier = Address::generate(&env);
         let empty_hash = Bytes::from_slice(&env, &[]);
         client.add_verifier(&admin, &verifier).unwrap();
-        assert!(client.try_set_debtor_score(&verifier, &empty_hash, &50u32).is_err());
+        assert!(client
+            .try_set_debtor_score(&verifier, &empty_hash, &50u32)
+            .is_err());
     }
 
     #[test]
@@ -666,7 +681,9 @@ mod tests {
         let (env, _, _, client) = setup();
         let stranger = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[0xABu8; 32]);
-        assert!(client.try_set_debtor_score(&stranger, &debtor_hash, &50u32).is_err());
+        assert!(client
+            .try_set_debtor_score(&stranger, &debtor_hash, &50u32)
+            .is_err());
     }
 
     #[test]
@@ -685,10 +702,14 @@ mod tests {
         client.set_debtor_score(&verifier, &hash0, &0u32).unwrap();
         assert_eq!(client.get_debtor_score(&hash0).unwrap(), 0u32);
         let hash100 = Bytes::from_slice(&env, &[0x02u8; 32]);
-        client.set_debtor_score(&verifier, &hash100, &100u32).unwrap();
+        client
+            .set_debtor_score(&verifier, &hash100, &100u32)
+            .unwrap();
         assert_eq!(client.get_debtor_score(&hash100).unwrap(), 100u32);
         let hash_invalid = Bytes::from_slice(&env, &[0x03u8; 32]);
-        assert!(client.try_set_debtor_score(&verifier, &hash_invalid, &101u32).is_err());
+        assert!(client
+            .try_set_debtor_score(&verifier, &hash_invalid, &101u32)
+            .is_err());
     }
 
     // ── views ─────────────────────────────────────────────────────────────────
@@ -721,7 +742,9 @@ mod tests {
         client.register_sme(&verifier, &sme100, &100u32).unwrap();
         assert_eq!(client.get_sme_profile(&sme100).unwrap().risk_score, 100);
         let sme_invalid = Address::generate(&env);
-        assert!(client.try_register_sme(&verifier, &sme_invalid, &101u32).is_err());
+        assert!(client
+            .try_register_sme(&verifier, &sme_invalid, &101u32)
+            .is_err());
     }
 
     // ── event emission ────────────────────────────────────────────────────────

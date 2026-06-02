@@ -1,21 +1,24 @@
 #![no_std]
 
-//! # Kora Shared Library — Audit Findings
+//! # Kora Shared Library
 //!
-//! ## Summary of Findings and Fixes
+//! Shared types, errors, events, validation helpers, and reentrancy guards
+//! used across all Kora Protocol contracts.
 //!
-//! ### 1. Missing Doc Comments on Validation Helpers (validation.rs)
-//! - **Issue:** All public validation functions lacked doc comments
-//! - **Fix:** AUDIT FIX: Added comprehensive /// doc comments to every public function
-//! - **Severity:** Medium — Documentation completeness
+//! ## Modules
 //!
-//! ### 2. Incorrect Error Type for Empty Bytes (validation.rs:39-43)
-//! - **Issue:** `require_non_empty_bytes()` returned `EmptyString` error (semantically wrong for bytes)
-//! - **Fix:** AUDIT FIX: Changed to return dedicated `EmptyBytes` error for semantic clarity
-//! - **Severity:** Low — Error categorization/semantics
+//! - [`errors`] — `KoraError` enum used across all contracts
+//! - [`events`] — Protocol event emission functions (single source of truth)
+//! - [`reentrancy`] — RAII reentrancy guard and low-level lock helpers
+//! - [`types`] — Shared data structures (`Invoice`, `Listing`, `Pool`, etc.)
+//! - [`validation`] — Reusable input validation guards and safe arithmetic
 //!
-//! All arithmetic operations use checked methods. All type definitions are well-documented.
-//! Error enum is comprehensive and specific.
+//! ## Design Principles
+//!
+//! - All financial calculations use checked arithmetic (`checked_*` methods)
+//! - No silent overflows — errors are returned as `KoraError::ArithmeticOverflow`
+//! - Input validation is centralized and consistent across all contracts
+//! - Storage keys use `#[contracttype]` enums for type safety
 
 pub mod errors;
 pub mod events;
