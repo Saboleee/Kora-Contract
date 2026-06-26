@@ -58,21 +58,7 @@ pub enum KoraError {
     EmptyBytes = 97,
     // Reentrancy guard triggered
     Reentrancy = 98,
-
-    // Multisig
-    ProposalNotFound = 100,
-    ProposalAlreadyExecuted = 101,
-    ProposalExpired = 102,
-    AlreadyApproved = 103,
-    ThresholdNotMet = 104,
-    InvalidThreshold = 105,
-    SignerAlreadyExists = 106,
-    SignerNotFound = 107,
-    MultisigNotConfigured = 108,
-
-    // Refund
-    FundingNotExpired = 110,
-    ListingFullyFunded = 111,
-    NoContribution = 112,
-    RefundAlreadyClaimed = 113,
+    // Upgrade
+    NoUpgradeProposed = 100,
+    UpgradeTimelockNotElapsed = 101,
 }

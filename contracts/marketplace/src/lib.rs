@@ -7,9 +7,9 @@ use kora_shared::{
     events,
     reentrancy::ReentrancyGuard,
     types::Listing,
-    validation::{bps_of, require_non_zero_amount, require_valid_fee_bps, safe_add, safe_sub},
+    validation::{bps_of_normalized, require_non_zero_amount, require_valid_fee_bps, safe_add, safe_sub, UPGRADE_TIMELOCK_DELAY},
 };
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env};
 
 // ~30 days in ledgers at ~5s/ledger
 const PERSISTENT_TTL_THRESHOLD: u32 = 518_400;
@@ -24,13 +24,11 @@ pub enum DataKey {
     InvoiceNft,
     FinancingPool,
     Treasury,
+    AccessControl,
     FeeBps,
     Listing(u64),
     WhitelistedToken(Address),
-    /// Tracks net contribution (amount sent to pool) per investor per listing.
-    Contribution(u64, Address),
-    /// Tracks whether an investor has claimed their refund for an expired listing.
-    RefundClaimed(u64, Address),
+    UpgradeProposal,
 }
 
 // ── Config struct ─────────────────────────────────────────────────────────────
@@ -42,6 +40,7 @@ pub struct MarketplaceConfig {
     pub invoice_nft: Address,
     pub financing_pool: Address,
     pub treasury: Address,
+    pub access_control: Address,
     pub fee_bps: u32,
 }
 
@@ -59,6 +58,7 @@ impl MarketplaceContract {
         invoice_nft: Address,
         financing_pool: Address,
         treasury: Address,
+        access_control: Address,
         fee_bps: u32,
     ) -> Result<(), KoraError> {
         if env.storage().instance().has(&DataKey::Config) {
@@ -70,6 +70,7 @@ impl MarketplaceContract {
             invoice_nft,
             financing_pool,
             treasury,
+            access_control,
             fee_bps,
         };
         env.storage().instance().set(&DataKey::Config, &config);
@@ -152,6 +153,7 @@ impl MarketplaceContract {
         funding_deadline: u64,
     ) -> Result<(), KoraError> {
         seller.require_auth();
+        Self::require_not_paused(&env)?;
 
         require_non_zero_amount(asking_price)?;
         require_non_zero_amount(face_value)?;
@@ -206,6 +208,7 @@ impl MarketplaceContract {
         amount: i128,
     ) -> Result<(), KoraError> {
         investor.require_auth();
+        Self::require_not_paused(&env)?;
 
         require_non_zero_amount(amount)?;
 
@@ -229,12 +232,13 @@ impl MarketplaceContract {
 
         let config = Self::load_config(&env)?;
 
-        let fee = bps_of(amount, config.fee_bps)?;
+        let token_client = token::Client::new(&env, &listing.token);
+        let token_decimals = token_client.decimals();
+
+        let fee = bps_of_normalized(amount, config.fee_bps, token_decimals)?;
         let net = amount
             .checked_sub(fee)
             .ok_or(KoraError::ArithmeticOverflow)?;
-
-        let token_client = token::Client::new(&env, &listing.token);
 
         // Transfer fee to treasury (if non-zero)
         if fee > 0 {
@@ -392,6 +396,45 @@ impl MarketplaceContract {
             .unwrap_or(false)
     }
 
+    // ── Upgrade ────────────────────────────────────────────────────────────────
+
+    pub fn propose_upgrade(
+        env: Env,
+        admin: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        let config = Self::load_config(&env)?;
+        if config.admin != admin {
+            return Err(KoraError::NotAdmin);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeProposal, &(new_wasm_hash.clone(), env.ledger().timestamp()));
+        events::upgrade_proposed(&env, &admin, &new_wasm_hash);
+        Ok(())
+    }
+
+    pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), KoraError> {
+        admin.require_auth();
+        let config = Self::load_config(&env)?;
+        if config.admin != admin {
+            return Err(KoraError::NotAdmin);
+        }
+        let (wasm_hash, proposed_at): (BytesN<32>, u64) = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeProposal)
+            .ok_or(KoraError::NoUpgradeProposed)?;
+        if env.ledger().timestamp() < proposed_at + UPGRADE_TIMELOCK_DELAY {
+            return Err(KoraError::UpgradeTimelockNotElapsed);
+        }
+        env.storage().instance().remove(&DataKey::UpgradeProposal);
+        events::upgrade_executed(&env, &admin, &wasm_hash);
+        env.deployer().update_current_contract_wasm(wasm_hash);
+        Ok(())
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────────
 
     fn load_config(env: &Env) -> Result<MarketplaceConfig, KoraError> {
@@ -420,6 +463,11 @@ impl MarketplaceContract {
             .instance()
             .get(&DataKey::Treasury)
             .ok_or(KoraError::NotInitialized)?;
+        let access_control: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccessControl)
+            .ok_or(KoraError::NotInitialized)?;
         let fee_bps: u32 = env
             .storage()
             .instance()
@@ -431,16 +479,23 @@ impl MarketplaceContract {
             invoice_nft,
             financing_pool,
             treasury,
+            access_control,
             fee_bps,
         };
         env.storage().instance().set(&DataKey::Config, &config);
         Ok(config)
     }
 
-    /// Stub for protocol-pause integration. In production this would call
-    /// `access_control.is_paused()` via cross-contract call. The address is
-    /// stored at initialization time and the check is wired at deployment.
-    fn require_not_paused(_env: &Env) -> Result<(), KoraError> {
+    /// cancel_listing is intentionally exempt from the pause check: during an
+    /// emergency pause, sellers and admins must still be able to cancel active
+    /// listings, similar to how financing_pool::repay is pause-exempt.
+    fn require_not_paused(env: &Env) -> Result<(), KoraError> {
+        let config = Self::load_config(env)?;
+        let client =
+            kora_access_control::AccessControlContractClient::new(env, &config.access_control);
+        if client.is_paused() {
+            return Err(KoraError::ProtocolPaused);
+        }
         Ok(())
     }
 
@@ -506,11 +561,13 @@ mod tests {
         let pool_id = env.register_contract(None, FinancingPoolContract);
         let pool_client = FinancingPoolContractClient::new(&env, &pool_id);
         let ac2 = Address::generate(&env);
-        pool_client.initialize(&admin, &nft_id, &treasury, &ac2, &200u32);
+        let oracle = Address::generate(&env);
+        pool_client.initialize(&admin, &nft_id, &treasury, &ac2, &200u32, &oracle);
 
+        let mp_ac = Address::generate(&env);
         let mp_id = env.register_contract(None, MarketplaceContract);
         let mp = MarketplaceContractClient::new(&env, &mp_id);
-        mp.initialize(&admin, &nft_id, &pool_id, &treasury, &50u32);
+        mp.initialize(&admin, &nft_id, &pool_id, &treasury, &mp_ac, &50u32);
 
         let token = Address::generate(&env);
         mp.whitelist_token(&admin, &token);
@@ -565,6 +622,7 @@ mod tests {
             &Address::generate(&t.env),
             &Address::generate(&t.env),
             &Address::generate(&t.env),
+            &Address::generate(&t.env),
             &50u32,
         );
         assert_eq!(result.unwrap_err().unwrap(), KoraError::AlreadyInitialized);
@@ -577,6 +635,7 @@ mod tests {
         let mp_id = env.register_contract(None, MarketplaceContract);
         let mp = MarketplaceContractClient::new(&env, &mp_id);
         let result = mp.try_initialize(
+            &Address::generate(&env),
             &Address::generate(&env),
             &Address::generate(&env),
             &Address::generate(&env),
@@ -598,6 +657,7 @@ mod tests {
                 &Address::generate(&env),
                 &Address::generate(&env),
                 &Address::generate(&env),
+                &Address::generate(&env),
                 &0u32,
             )
             .is_ok());
@@ -611,6 +671,7 @@ mod tests {
         let mp = MarketplaceContractClient::new(&env, &mp_id);
         assert!(mp
             .try_initialize(
+                &Address::generate(&env),
                 &Address::generate(&env),
                 &Address::generate(&env),
                 &Address::generate(&env),
@@ -1133,5 +1194,22 @@ mod tests {
         // asking_price = 9_500_000_000; any amount > that is rejected before overflow
         let result = t.mp.try_fund_invoice(&investor, &id, &i128::MAX);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_fund_cancelled_listing() {
+        let t = deploy();
+        let id = list_one(&t);
+
+        t.mp.cancel_listing(&t.seller, &id);
+        let listing = t.mp.get_listing(&id);
+        assert!(!listing.is_active);
+
+        let investor = Address::generate(&t.env);
+        let result = t.mp.try_fund_invoice(&investor, &id, &1_000_000i128);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            KoraError::ListingAlreadyCancelled
+        );
     }
 }

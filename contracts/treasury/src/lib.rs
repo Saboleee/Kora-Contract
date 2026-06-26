@@ -4,9 +4,9 @@ use kora_shared::{
     errors::KoraError,
     events,
     reentrancy::ReentrancyGuard,
-    validation::require_valid_fee_bps,
+    validation::{require_valid_fee_bps, UPGRADE_TIMELOCK_DELAY},
 };
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env};
 
 // ── Storage TTL constants (~31 days in ledgers) ───────────────────────────────
 const PERSISTENT_BUMP_AMOUNT: u32 = 535_680;
@@ -24,6 +24,8 @@ pub enum DataKey {
     Collected(Address),
     /// Whitelisted token flag.
     WhitelistedToken(Address),
+    /// Pending upgrade proposal: (wasm_hash, proposed_at_timestamp).
+    UpgradeProposal,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -205,6 +207,39 @@ impl TreasuryContract {
             .persistent()
             .get(&DataKey::Admin)
             .ok_or(KoraError::NotInitialized)
+    }
+
+    // ── Upgrade ────────────────────────────────────────────────────────────────
+
+    pub fn propose_upgrade(
+        env: Env,
+        admin: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeProposal, &(new_wasm_hash.clone(), env.ledger().timestamp()));
+        events::upgrade_proposed(&env, &admin, &new_wasm_hash);
+        Ok(())
+    }
+
+    pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let (wasm_hash, proposed_at): (BytesN<32>, u64) = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeProposal)
+            .ok_or(KoraError::NoUpgradeProposed)?;
+        if env.ledger().timestamp() < proposed_at + UPGRADE_TIMELOCK_DELAY {
+            return Err(KoraError::UpgradeTimelockNotElapsed);
+        }
+        env.storage().instance().remove(&DataKey::UpgradeProposal);
+        events::upgrade_executed(&env, &admin, &wasm_hash);
+        env.deployer().update_current_contract_wasm(wasm_hash);
+        Ok(())
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

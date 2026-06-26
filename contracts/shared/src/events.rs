@@ -78,6 +78,14 @@ pub fn yield_distributed(env: &Env, invoice_id: u64, investor: &Address, yield_a
     );
 }
 
+pub fn late_penalty_applied(env: &Env, invoice_id: u64, penalty_amount: i128, total_owed: i128) {
+    emit(
+        env,
+        symbol_short!("LATE_PEN"),
+        (invoice_id, penalty_amount, total_owed, env.ledger().timestamp()),
+    );
+}
+
 // ── Marketplace Events ──────────────────────────────────────────────────────
 
 pub fn listing_cancelled(env: &Env, invoice_id: u64, seller: &Address) {
@@ -312,6 +320,24 @@ pub fn registry_initialized(env: &Env, admin: &Address, invoice_nft: &Address) {
         env,
         symbol_short!("REG_INI"),
         (admin.clone(), invoice_nft.clone()),
+    );
+}
+
+// ── Upgrade Events ───────────────────────────────────────────────────────────
+
+pub fn upgrade_proposed(env: &Env, admin: &Address, wasm_hash: &soroban_sdk::BytesN<32>) {
+    emit(
+        env,
+        symbol_short!("UPG_PROP"),
+        (admin.clone(), wasm_hash.clone(), env.ledger().timestamp()),
+    );
+}
+
+pub fn upgrade_executed(env: &Env, admin: &Address, wasm_hash: &soroban_sdk::BytesN<32>) {
+    emit(
+        env,
+        symbol_short!("UPG_EXEC"),
+        (admin.clone(), wasm_hash.clone(), env.ledger().timestamp()),
     );
 }
 

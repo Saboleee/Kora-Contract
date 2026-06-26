@@ -1,6 +1,9 @@
 use crate::errors::KoraError;
 use soroban_sdk::{Bytes, Env, String};
 
+/// Minimum timelock delay for upgrade proposals (24 hours in seconds).
+pub const UPGRADE_TIMELOCK_DELAY: u64 = 86_400;
+
 // ── Amount guards ─────────────────────────────────────────────────────────────
 
 /// Reject zero or negative amounts.
@@ -119,6 +122,69 @@ pub fn safe_div(a: i128, b: i128) -> Result<i128, KoraError> {
         return Err(KoraError::InvalidAmount);
     }
     a.checked_div(b).ok_or(KoraError::ArithmeticOverflow)
+}
+
+// ── Decimal normalization ────────────────────────────────────────────────────
+
+/// The standard decimal precision used for all internal arithmetic (7 decimals,
+/// matching Stellar's stroop convention: 1 XLM = 10^7 stroops).
+pub const STANDARD_DECIMALS: u32 = 7;
+
+/// Normalize an amount from `token_decimals` to `STANDARD_DECIMALS`.
+/// Scales up (multiplies) if token has fewer decimals, scales down (divides)
+/// if token has more. Returns `ArithmeticOverflow` on overflow.
+pub fn normalize_amount(amount: i128, token_decimals: u32) -> Result<i128, KoraError> {
+    if token_decimals == STANDARD_DECIMALS {
+        return Ok(amount);
+    }
+    if token_decimals < STANDARD_DECIMALS {
+        let scale = 10i128
+            .checked_pow(STANDARD_DECIMALS - token_decimals)
+            .ok_or(KoraError::ArithmeticOverflow)?;
+        amount.checked_mul(scale).ok_or(KoraError::ArithmeticOverflow)
+    } else {
+        let scale = 10i128
+            .checked_pow(token_decimals - STANDARD_DECIMALS)
+            .ok_or(KoraError::ArithmeticOverflow)?;
+        amount.checked_div(scale).ok_or(KoraError::ArithmeticOverflow)
+    }
+}
+
+/// Denormalize an amount from `STANDARD_DECIMALS` back to `token_decimals`.
+pub fn denormalize_amount(amount: i128, token_decimals: u32) -> Result<i128, KoraError> {
+    if token_decimals == STANDARD_DECIMALS {
+        return Ok(amount);
+    }
+    if token_decimals < STANDARD_DECIMALS {
+        let scale = 10i128
+            .checked_pow(STANDARD_DECIMALS - token_decimals)
+            .ok_or(KoraError::ArithmeticOverflow)?;
+        amount.checked_div(scale).ok_or(KoraError::ArithmeticOverflow)
+    } else {
+        let scale = 10i128
+            .checked_pow(token_decimals - STANDARD_DECIMALS)
+            .ok_or(KoraError::ArithmeticOverflow)?;
+        amount.checked_mul(scale).ok_or(KoraError::ArithmeticOverflow)
+    }
+}
+
+/// Compute `amount * bps / 10_000` with decimal normalization.
+/// Normalizes to STANDARD_DECIMALS, computes bps, then denormalizes back.
+/// For same-decimal (7) tokens, behavior is identical to `bps_of`.
+pub fn bps_of_normalized(
+    amount: i128,
+    bps: u32,
+    token_decimals: u32,
+) -> Result<i128, KoraError> {
+    if amount < 0 {
+        return Err(KoraError::InvalidAmount);
+    }
+    let normalized = normalize_amount(amount, token_decimals)?;
+    let result = normalized
+        .checked_mul(bps as i128)
+        .and_then(|v| v.checked_div(10_000))
+        .ok_or(KoraError::ArithmeticOverflow)?;
+    denormalize_amount(result, token_decimals)
 }
 
 // ── TTL helpers ──────────────────────────────────────────────────────────────
@@ -348,6 +414,48 @@ mod tests {
         assert!(require_valid_risk_score(99).is_ok());
         assert!(require_valid_risk_score(100).is_ok());
         assert!(require_valid_risk_score(101).is_err());
+    }
+
+    #[test]
+    fn test_normalize_amount_same_decimals_noop() {
+        assert_eq!(normalize_amount(1_000_000, 7).unwrap(), 1_000_000);
+    }
+
+    #[test]
+    fn test_normalize_amount_6_to_7_scales_up() {
+        // USDC 6-decimal: 1 USDC = 1_000_000 → normalized to 10_000_000
+        assert_eq!(normalize_amount(1_000_000, 6).unwrap(), 10_000_000);
+    }
+
+    #[test]
+    fn test_normalize_amount_8_to_7_scales_down() {
+        assert_eq!(normalize_amount(100_000_000, 8).unwrap(), 10_000_000);
+    }
+
+    #[test]
+    fn test_denormalize_amount_roundtrip() {
+        let original = 5_000_000i128;
+        let normalized = normalize_amount(original, 6).unwrap();
+        let back = denormalize_amount(normalized, 6).unwrap();
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn test_bps_of_normalized_same_decimal_matches_bps_of() {
+        // 7 decimals: bps_of_normalized should match bps_of
+        assert_eq!(bps_of_normalized(10_000, 100, 7).unwrap(), bps_of(10_000, 100).unwrap());
+        assert_eq!(bps_of_normalized(1_000_000, 50, 7).unwrap(), bps_of(1_000_000, 50).unwrap());
+    }
+
+    #[test]
+    fn test_bps_of_normalized_6_decimal_token() {
+        // 1 USDC (6 dec) = 1_000_000. 1% (100 bps) fee = 10_000
+        assert_eq!(bps_of_normalized(1_000_000, 100, 6).unwrap(), 10_000);
+    }
+
+    #[test]
+    fn test_bps_of_normalized_negative_rejected() {
+        assert!(bps_of_normalized(-1_000, 50, 6).is_err());
     }
 }
 
