@@ -61,7 +61,9 @@ mod financing_pool_edge_cases {
         // Deploy Pool
         let pool_id = env.register_contract(None, kora_financing_pool::FinancingPoolContract);
         let pool_client = FinancingPoolContractClient::new(&env, &pool_id);
-        pool_client.initialize(&admin, &nft_id, &treasury, &200u32);
+        let ac2 = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        pool_client.initialize(&admin, &nft_id, &treasury, &ac2, &200u32, &oracle);
 
         TestEnv {
             env,

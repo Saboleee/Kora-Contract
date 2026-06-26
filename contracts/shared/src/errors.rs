@@ -58,4 +58,7 @@ pub enum KoraError {
     EmptyBytes = 97,
     // Reentrancy guard triggered
     Reentrancy = 98,
+    // Upgrade
+    NoUpgradeProposed = 100,
+    UpgradeTimelockNotElapsed = 101,
 }

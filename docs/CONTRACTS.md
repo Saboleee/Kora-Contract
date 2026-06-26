@@ -152,9 +152,18 @@ Errors: `ListingNotFound`
 
 ## `financing_pool`
 
-### `initialize(admin, invoice_nft, treasury, late_penalty_bps)`
+### `initialize(admin, invoice_nft, treasury, access_control, late_penalty_bps, price_oracle)`
 
 One-time setup.
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `admin` | `Address` | Protocol admin |
+| `invoice_nft` | `Address` | Deployed invoice_nft contract |
+| `treasury` | `Address` | Deployed treasury contract |
+| `access_control` | `Address` | Deployed access_control contract |
+| `late_penalty_bps` | `u32` | Late penalty in basis points. Max 10,000 (100%). |
+| `price_oracle` | `Address` | Deployed price_oracle contract for FX conversion |
 
 ---
 
@@ -176,12 +185,14 @@ Records an investor's position in the pool. Admin only (called internally).
 
 SME repays the invoice. If fully repaid, distributes yield to all investors and marks NFT as `Repaid`.
 
+**Late penalty model:** On the first repayment call where `ledger.timestamp > invoice.due_date`, a one-time flat penalty of `bps_of(face_value, late_penalty_bps)` is added to `total_owed`. Subsequent repayments (partial or full) are tracked against `total_owed` so the penalty is never double-counted. Uses the same bps conventions as marketplace `fee_bps`.
+
 | Param | Type | Description |
 |-------|------|-------------|
 | `payer` | `Address` | Must sign. |
 | `amount` | `i128` | Repayment amount in stroops. |
 
-Errors: `PoolNotFound`, `RepaymentAlreadyMade`
+Errors: `PoolNotFound`, `RepaymentAlreadyMade`, `ArithmeticOverflow`
 
 ---
 
@@ -360,3 +371,43 @@ Returns the role assigned to an address.
 Returns the current admin address.
 
 Errors: `NotInitialized`
+
+---
+
+## `price_oracle`
+
+Mock/testnet-compatible price oracle for cross-currency conversion. Prices are stored as stroops-scaled values (1e7 = 1.0). The oracle rejects reads of prices older than 3600 seconds (1 hour) to prevent stale-price exploits.
+
+### `initialize(admin)`
+
+One-time setup.
+
+---
+
+### `set_price(admin, base, quote, price)`
+
+Set the exchange rate for a currency pair. Admin only. Price is `base` per 1 `quote`, scaled by 1e7.
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `base` | `Symbol` | Base currency symbol (e.g. `EURC`) |
+| `quote` | `Symbol` | Quote currency symbol (e.g. `USDC`) |
+| `price` | `i128` | Exchange rate scaled by 1e7 |
+
+Errors: `NotAdmin`, `InvalidAmount`
+
+---
+
+### `get_price(base, quote) → PriceData`
+
+Returns the price and its timestamp. Fails if the price is stale (> 1 hour) or missing.
+
+Errors: `InvalidAmount` (missing), `InvoiceExpired` (stale)
+
+---
+
+### `convert(amount, from, to) → i128`
+
+Convert an amount between currencies. Returns the same amount if `from == to`. Uses `get_price` internally, so it inherits staleness checks.
+
+Errors: `InvalidAmount`, `InvoiceExpired`, `ArithmeticOverflow`

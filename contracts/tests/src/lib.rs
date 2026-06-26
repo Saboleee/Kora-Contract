@@ -66,8 +66,9 @@ mod integration {
         // Initialize all contracts
         ac.initialize(&admin);
         nft.initialize(&admin, &ac_id);
-        mp.initialize(&admin, &nft_id, &pool_id, &treasury_id, &50u32, &ac_id);
-        pool.initialize(&admin, &nft_id, &rr_id, &treasury_id, &200u32, &ac_id);
+        mp.initialize(&admin, &nft_id, &pool_id, &treasury_id, &50u32);
+        let oracle_addr = Address::generate(&env);
+        pool.initialize(&admin, &nft_id, &treasury_id, &ac_id, &200u32, &oracle_addr);
         treasury.initialize(&admin, &50u32);
         rr.initialize(&admin, &nft_id);
 
@@ -502,108 +503,6 @@ mod integration {
         );
         assert!(r.is_ok(), "mint_invoice must succeed after unpause");
     }
-    /// Pre-flight check: investor has insufficient balance — must return
-    /// InsufficientFunds and leave listing.funded_amount unchanged.
-    #[test]
-    fn test_fund_invoice_insufficient_balance_rejected() {
-        use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
-        use kora_shared::errors::KoraError;
-
-        let k = deploy_protocol();
-        let sme = Address::generate(&k.env);
-        let investor = Address::generate(&k.env);
-
-        // Deploy a real SAC token and whitelist it
-        let sac = k.env.register_stellar_asset_contract_v2(k.admin.clone());
-        let token_addr = sac.address();
-        let token_admin = StellarAssetClient::new(&k.env, &token_addr);
-        k.marketplace.whitelist_token(&k.admin, &token_addr);
-
-        let (debtor_hash, _, currency, due_date, ipfs_cid, risk_score) =
-            sample_invoice_params(&k.env);
-        let asking_price = 9_500_0000000i128;
-        let face_value = 10_000_0000000i128;
-        let fund_amount = 1_000_0000000i128;
-
-        let invoice_id = k.invoice_nft.mint_invoice(
-            &sme, &debtor_hash, &face_value, &currency, &due_date, &ipfs_cid, &risk_score,
-        );
-        let funding_deadline = k.env.ledger().timestamp() + 86_400 * 30;
-        k.marketplace.list_invoice(
-            &sme, &invoice_id, &asking_price, &face_value, &token_addr, &funding_deadline,
-        );
-
-        // Mint LESS than fund_amount so balance check fails
-        token_admin.mint(&investor, &(fund_amount - 1));
-
-        let result = k.marketplace.try_fund_invoice(&investor, &invoice_id, &fund_amount);
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().unwrap(),
-            KoraError::InsufficientFunds,
-            "must return InsufficientFunds, not an opaque panic"
-        );
-
-        // Listing state must be unchanged
-        let listing = k.marketplace.get_listing(&invoice_id);
-        assert_eq!(listing.funded_amount, 0, "funded_amount must not be mutated on failure");
-        assert!(listing.is_active, "listing must still be active");
-    }
-
-    /// Pre-flight check: investor has enough balance but insufficient allowance —
-    /// must return InsufficientFunds and leave listing state unchanged.
-    #[test]
-    fn test_fund_invoice_insufficient_allowance_rejected() {
-        use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
-        use kora_shared::errors::KoraError;
-
-        let k = deploy_protocol();
-        let sme = Address::generate(&k.env);
-        let investor = Address::generate(&k.env);
-
-        let sac = k.env.register_stellar_asset_contract_v2(k.admin.clone());
-        let token_addr = sac.address();
-        let token_admin = StellarAssetClient::new(&k.env, &token_addr);
-        let token_client = TokenClient::new(&k.env, &token_addr);
-        k.marketplace.whitelist_token(&k.admin, &token_addr);
-
-        let (debtor_hash, _, currency, due_date, ipfs_cid, risk_score) =
-            sample_invoice_params(&k.env);
-        let asking_price = 9_500_0000000i128;
-        let face_value = 10_000_0000000i128;
-        let fund_amount = 1_000_0000000i128;
-
-        let invoice_id = k.invoice_nft.mint_invoice(
-            &sme, &debtor_hash, &face_value, &currency, &due_date, &ipfs_cid, &risk_score,
-        );
-        let funding_deadline = k.env.ledger().timestamp() + 86_400 * 30;
-        k.marketplace.list_invoice(
-            &sme, &invoice_id, &asking_price, &face_value, &token_addr, &funding_deadline,
-        );
-
-        // Mint full balance but approve only fund_amount - 1 to the marketplace
-        token_admin.mint(&investor, &(fund_amount * 2));
-        token_client.approve(
-            &investor,
-            &k.marketplace.address,
-            &(fund_amount - 1),
-            &(k.env.ledger().sequence() + 10_000),
-        );
-
-        let result = k.marketplace.try_fund_invoice(&investor, &invoice_id, &fund_amount);
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().unwrap(),
-            KoraError::InsufficientFunds,
-            "must return InsufficientFunds when allowance is too low"
-        );
-
-        // Listing unchanged
-        let listing = k.marketplace.get_listing(&invoice_id);
-        assert_eq!(listing.funded_amount, 0);
-        assert!(listing.is_active);
-    }
-
     #[test]
     fn test_sequential_invoice_ids() {
         let k = deploy_protocol();

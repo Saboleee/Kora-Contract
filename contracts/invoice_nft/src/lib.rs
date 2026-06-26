@@ -19,10 +19,10 @@ use kora_shared::{
     types::{Invoice, InvoiceStatus, RiskTier},
     validation::{
         require_future_timestamp, require_non_empty_bytes, require_non_empty_string,
-        require_non_zero_amount, require_valid_risk_score,
+        require_non_zero_amount, require_valid_risk_score, UPGRADE_TIMELOCK_DELAY,
     },
 };
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env, String, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol};
 
 // ── TTL constants (~30 days at ~5s/ledger) ───────────────────────────────────
 const PERSISTENT_TTL_THRESHOLD: u32 = 518_400;
@@ -60,6 +60,8 @@ pub enum DataKey {
     AccessControl,
     /// Instance key: current schema migration version (starts at 1)
     MigrationVersion,
+    /// Pending upgrade proposal: (wasm_hash, proposed_at_timestamp).
+    UpgradeProposal,
 }
 
 
@@ -311,6 +313,39 @@ impl InvoiceNftContract {
             .saturating_sub(1)
     }
 
+    // ── Upgrade ────────────────────────────────────────────────────────────────
+
+    pub fn propose_upgrade(
+        env: Env,
+        admin: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeProposal, &(new_wasm_hash.clone(), env.ledger().timestamp()));
+        events::upgrade_proposed(&env, &admin, &new_wasm_hash);
+        Ok(())
+    }
+
+    pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let (wasm_hash, proposed_at): (BytesN<32>, u64) = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeProposal)
+            .ok_or(KoraError::NoUpgradeProposed)?;
+        if env.ledger().timestamp() < proposed_at + UPGRADE_TIMELOCK_DELAY {
+            return Err(KoraError::UpgradeTimelockNotElapsed);
+        }
+        env.storage().instance().remove(&DataKey::UpgradeProposal);
+        events::upgrade_executed(&env, &admin, &wasm_hash);
+        env.deployer().update_current_contract_wasm(wasm_hash);
+        Ok(())
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     fn load_invoice(env: &Env, id: u64) -> Result<Invoice, KoraError> {
@@ -332,8 +367,6 @@ impl InvoiceNftContract {
         Ok(())
     }
 
-    /// Check the protocol pause flag stored in the AccessControl contract.
-    /// Falls back to unpaused if the AccessControl address is not set (e.g. in tests).
     fn require_not_paused(env: &Env) -> Result<(), KoraError> {
         if let Some(ac_contract) = env
             .storage()
@@ -350,9 +383,10 @@ impl InvoiceNftContract {
             .instance()
             .get(&DataKey::AccessControl)
             .ok_or(KoraError::NotInitialized)?;
-        let _ = ac;
-        // Cross-contract pause check wired at deployment via AccessControl contract.
-        // Local guard: no-op until cross-contract call is integrated.
+        let client = kora_access_control::AccessControlContractClient::new(env, &ac);
+        if client.is_paused() {
+            return Err(KoraError::ProtocolPaused);
+        }
         Ok(())
     }
 

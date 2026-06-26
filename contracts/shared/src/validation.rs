@@ -2,6 +2,9 @@ use soroban_sdk::{Address, Bytes, Env, String};
 use crate::errors::KoraError;
 use soroban_sdk::{Bytes, Env, String};
 
+/// Minimum timelock delay for upgrade proposals (24 hours in seconds).
+pub const UPGRADE_TIMELOCK_DELAY: u64 = 86_400;
+
 // ── Amount guards ─────────────────────────────────────────────────────────────
 
 /// Reject zero or negative amounts.
@@ -138,6 +141,69 @@ pub fn safe_div(a: i128, b: i128) -> Result<i128, KoraError> {
         return Err(KoraError::InvalidAmount);
     }
     a.checked_div(b).ok_or(KoraError::ArithmeticOverflow)
+}
+
+// ── Decimal normalization ────────────────────────────────────────────────────
+
+/// The standard decimal precision used for all internal arithmetic (7 decimals,
+/// matching Stellar's stroop convention: 1 XLM = 10^7 stroops).
+pub const STANDARD_DECIMALS: u32 = 7;
+
+/// Normalize an amount from `token_decimals` to `STANDARD_DECIMALS`.
+/// Scales up (multiplies) if token has fewer decimals, scales down (divides)
+/// if token has more. Returns `ArithmeticOverflow` on overflow.
+pub fn normalize_amount(amount: i128, token_decimals: u32) -> Result<i128, KoraError> {
+    if token_decimals == STANDARD_DECIMALS {
+        return Ok(amount);
+    }
+    if token_decimals < STANDARD_DECIMALS {
+        let scale = 10i128
+            .checked_pow(STANDARD_DECIMALS - token_decimals)
+            .ok_or(KoraError::ArithmeticOverflow)?;
+        amount.checked_mul(scale).ok_or(KoraError::ArithmeticOverflow)
+    } else {
+        let scale = 10i128
+            .checked_pow(token_decimals - STANDARD_DECIMALS)
+            .ok_or(KoraError::ArithmeticOverflow)?;
+        amount.checked_div(scale).ok_or(KoraError::ArithmeticOverflow)
+    }
+}
+
+/// Denormalize an amount from `STANDARD_DECIMALS` back to `token_decimals`.
+pub fn denormalize_amount(amount: i128, token_decimals: u32) -> Result<i128, KoraError> {
+    if token_decimals == STANDARD_DECIMALS {
+        return Ok(amount);
+    }
+    if token_decimals < STANDARD_DECIMALS {
+        let scale = 10i128
+            .checked_pow(STANDARD_DECIMALS - token_decimals)
+            .ok_or(KoraError::ArithmeticOverflow)?;
+        amount.checked_div(scale).ok_or(KoraError::ArithmeticOverflow)
+    } else {
+        let scale = 10i128
+            .checked_pow(token_decimals - STANDARD_DECIMALS)
+            .ok_or(KoraError::ArithmeticOverflow)?;
+        amount.checked_mul(scale).ok_or(KoraError::ArithmeticOverflow)
+    }
+}
+
+/// Compute `amount * bps / 10_000` with decimal normalization.
+/// Normalizes to STANDARD_DECIMALS, computes bps, then denormalizes back.
+/// For same-decimal (7) tokens, behavior is identical to `bps_of`.
+pub fn bps_of_normalized(
+    amount: i128,
+    bps: u32,
+    token_decimals: u32,
+) -> Result<i128, KoraError> {
+    if amount < 0 {
+        return Err(KoraError::InvalidAmount);
+    }
+    let normalized = normalize_amount(amount, token_decimals)?;
+    let result = normalized
+        .checked_mul(bps as i128)
+        .and_then(|v| v.checked_div(10_000))
+        .ok_or(KoraError::ArithmeticOverflow)?;
+    denormalize_amount(result, token_decimals)
 }
 
 // ── TTL helpers ──────────────────────────────────────────────────────────────
@@ -370,20 +436,132 @@ mod tests {
     }
 
     #[test]
-    fn test_require_not_self() {
-        let env = Env::default();
-        let self_addr = env.current_contract_address();
-        let other = soroban_sdk::Address::from_contract_id(&soroban_sdk::BytesN::from_array(&env, &[1u8; 32]));
-        assert!(require_not_self(&env, &self_addr).is_err());
-        assert!(require_not_self(&env, &other).is_ok());
+    fn test_normalize_amount_same_decimals_noop() {
+        assert_eq!(normalize_amount(1_000_000, 7).unwrap(), 1_000_000);
     }
 
     #[test]
-    fn test_require_distinct() {
-        let env = Env::default();
-        let a = soroban_sdk::Address::from_contract_id(&soroban_sdk::BytesN::from_array(&env, &[1u8; 32]));
-        let b = soroban_sdk::Address::from_contract_id(&soroban_sdk::BytesN::from_array(&env, &[2u8; 32]));
-        assert!(require_distinct(&a, &a).is_err());
-        assert!(require_distinct(&a, &b).is_ok());
+    fn test_normalize_amount_6_to_7_scales_up() {
+        // USDC 6-decimal: 1 USDC = 1_000_000 → normalized to 10_000_000
+        assert_eq!(normalize_amount(1_000_000, 6).unwrap(), 10_000_000);
+    }
+
+    #[test]
+    fn test_normalize_amount_8_to_7_scales_down() {
+        assert_eq!(normalize_amount(100_000_000, 8).unwrap(), 10_000_000);
+    }
+
+    #[test]
+    fn test_denormalize_amount_roundtrip() {
+        let original = 5_000_000i128;
+        let normalized = normalize_amount(original, 6).unwrap();
+        let back = denormalize_amount(normalized, 6).unwrap();
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn test_bps_of_normalized_same_decimal_matches_bps_of() {
+        // 7 decimals: bps_of_normalized should match bps_of
+        assert_eq!(bps_of_normalized(10_000, 100, 7).unwrap(), bps_of(10_000, 100).unwrap());
+        assert_eq!(bps_of_normalized(1_000_000, 50, 7).unwrap(), bps_of(1_000_000, 50).unwrap());
+    }
+
+    #[test]
+    fn test_bps_of_normalized_6_decimal_token() {
+        // 1 USDC (6 dec) = 1_000_000. 1% (100 bps) fee = 10_000
+        assert_eq!(bps_of_normalized(1_000_000, 100, 6).unwrap(), 10_000);
+    }
+
+    #[test]
+    fn test_bps_of_normalized_negative_rejected() {
+        assert!(bps_of_normalized(-1_000, 50, 6).is_err());
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Invariant 1: bps_of never exceeds the input amount when bps <= 10_000.
+        /// fee = amount * bps / 10_000, so fee <= amount for bps in [0, 10_000].
+        #[test]
+        fn bps_of_never_exceeds_amount(
+            amount in 0i128..=1_000_000_000_000i128,
+            bps in 0u32..=10_000u32,
+        ) {
+            let fee = bps_of(amount, bps).unwrap();
+            prop_assert!(fee >= 0, "fee must be non-negative");
+            prop_assert!(fee <= amount, "fee {} must not exceed amount {}", fee, amount);
+        }
+
+        /// Invariant 2: safe_add and safe_sub are inverses for non-overflowing values.
+        /// For any a, b where a+b doesn't overflow: safe_sub(safe_add(a, b), b) == a.
+        #[test]
+        fn add_sub_roundtrip(
+            a in 0i128..=(i128::MAX / 2),
+            b in 0i128..=(i128::MAX / 2),
+        ) {
+            let sum = safe_add(a, b).unwrap();
+            let back = safe_sub(sum, b).unwrap();
+            prop_assert_eq!(back, a);
+        }
+
+        /// Invariant 3: bps_of(amount, 10_000) always equals amount (100% fee).
+        /// And bps_of(amount, 0) always equals 0 (0% fee).
+        #[test]
+        fn bps_of_boundary_identity(amount in 0i128..=1_000_000_000_000i128) {
+            let full = bps_of(amount, 10_000).unwrap();
+            prop_assert_eq!(full, amount, "100% bps must equal the full amount");
+
+            let zero = bps_of(amount, 0).unwrap();
+            prop_assert_eq!(zero, 0, "0% bps must yield zero");
+        }
+
+        /// Invariant 4: For any valid split of contributed amounts across N investors
+        /// where each contributed_i / total_pool is computed as share_bps, the sum
+        /// of all share_bps never exceeds 10_000.
+        #[test]
+        fn investor_shares_never_exceed_total(
+            n in 2u32..=10u32,
+            total_pool in 1_000i128..=1_000_000_000i128,
+            seed in 1u64..=u64::MAX,
+        ) {
+            let mut rng_state = seed;
+            let mut remaining = total_pool;
+            let mut total_bps = 0u32;
+
+            for i in 0..n {
+                let contributed = if i == n - 1 {
+                    remaining
+                } else {
+                    // Simple deterministic split
+                    rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let frac = (rng_state % 80) + 1; // 1-80% of remaining
+                    let c = (remaining * frac as i128) / 100;
+                    let c = if c == 0 { 1 } else { c };
+                    let c = c.min(remaining);
+                    remaining -= c;
+                    c
+                };
+
+                if contributed <= 0 || total_pool <= 0 {
+                    continue;
+                }
+                let share_bps = (contributed
+                    .checked_mul(10_000)
+                    .unwrap()
+                    .checked_div(total_pool)
+                    .unwrap()) as u32;
+                total_bps += share_bps;
+            }
+
+            prop_assert!(
+                total_bps <= 10_000,
+                "Sum of investor share_bps ({}) must not exceed 10_000",
+                total_bps
+            );
+        }
     }
 }

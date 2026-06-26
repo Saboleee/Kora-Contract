@@ -1,9 +1,12 @@
 #![no_std]
 
-use kora_shared::{errors::KoraError, events, reentrancy::ReentrancyGuard};
-
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
-use kora_shared::{errors::KoraError, events};
+use kora_shared::{
+    errors::KoraError,
+    events,
+    reentrancy::ReentrancyGuard,
+    validation::UPGRADE_TIMELOCK_DELAY,
+};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env};
 
 // ── TTL constants (~30 days) ──────────────────────────────────────────────────
 const PERSISTENT_TTL_THRESHOLD: u32 = 518_400;
@@ -19,7 +22,11 @@ pub enum DataKey {
     Paused,
     /// Per-address role mapping.
     Role(Address),
+    /// Pending upgrade proposal: (wasm_hash, proposed_at_timestamp).
+    UpgradeProposal,
 }
+
+const PROPOSAL_TTL_LEDGERS: u64 = 120_960; // ~7 days at ~5s/ledger
 
 // ── Role enum ─────────────────────────────────────────────────────────────────
 
@@ -198,6 +205,217 @@ impl AccessControlContract {
         Ok(())
     }
 
+    // ── Multisig ──────────────────────────────────────────────────────────────
+
+    /// Configure the N-of-M multisig. Admin only. Once configured, admin
+    /// actions must go through propose → approve → execute.
+    pub fn configure_multisig(
+        env: Env,
+        admin: Address,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+
+        let signer_count = signers.len();
+        if threshold == 0 || threshold > signer_count {
+            return Err(KoraError::InvalidThreshold);
+        }
+
+        let config = MultisigConfig {
+            threshold,
+            signers,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::MultisigConfig, &config);
+        Self::bump_persistent(&env, &DataKey::MultisigConfig);
+
+        if !env.storage().persistent().has(&DataKey::NextProposalId) {
+            env.storage()
+                .persistent()
+                .set(&DataKey::NextProposalId, &1u64);
+        }
+
+        events::multisig_configured(&env, threshold, signer_count);
+        Ok(())
+    }
+
+    /// Propose a new admin action. Caller must be a signer.
+    pub fn propose_action(
+        env: Env,
+        proposer: Address,
+        action: AdminAction,
+    ) -> Result<u64, KoraError> {
+        proposer.require_auth();
+        let config = Self::load_multisig_config(&env)?;
+        Self::require_signer(&config, &proposer)?;
+
+        let proposal_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextProposalId)
+            .unwrap_or(1);
+
+        let mut approvals = Vec::new(&env);
+        approvals.push_back(proposer.clone());
+
+        let proposal = Proposal {
+            id: proposal_id,
+            action,
+            proposer: proposer.clone(),
+            approvals,
+            executed: false,
+            created_at: env.ledger().timestamp(),
+            expires_at: env.ledger().timestamp() + PROPOSAL_TTL_LEDGERS,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        Self::bump_persistent(&env, &DataKey::Proposal(proposal_id));
+
+        env.storage().persistent().set(
+            &DataKey::NextProposalId,
+            &(proposal_id
+                .checked_add(1)
+                .ok_or(KoraError::ArithmeticOverflow)?),
+        );
+
+        events::action_proposed(&env, proposal_id, &proposer);
+        Ok(proposal_id)
+    }
+
+    /// Approve an existing proposal. Caller must be a signer who hasn't
+    /// already approved this proposal.
+    pub fn approve_action(
+        env: Env,
+        approver: Address,
+        proposal_id: u64,
+    ) -> Result<(), KoraError> {
+        approver.require_auth();
+        let config = Self::load_multisig_config(&env)?;
+        Self::require_signer(&config, &approver)?;
+
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(KoraError::ProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(KoraError::ProposalAlreadyExecuted);
+        }
+        if env.ledger().timestamp() > proposal.expires_at {
+            return Err(KoraError::ProposalExpired);
+        }
+
+        for i in 0..proposal.approvals.len() {
+            if proposal.approvals.get(i).unwrap() == approver {
+                return Err(KoraError::AlreadyApproved);
+            }
+        }
+
+        proposal.approvals.push_back(approver.clone());
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        Self::bump_persistent(&env, &DataKey::Proposal(proposal_id));
+
+        events::action_approved(&env, proposal_id, &approver, proposal.approvals.len());
+        Ok(())
+    }
+
+    /// Execute a proposal once the approval threshold is met.
+    /// Any signer can call execute.
+    pub fn execute_action(
+        env: Env,
+        executor: Address,
+        proposal_id: u64,
+    ) -> Result<(), KoraError> {
+        executor.require_auth();
+        let config = Self::load_multisig_config(&env)?;
+        Self::require_signer(&config, &executor)?;
+
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(KoraError::ProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(KoraError::ProposalAlreadyExecuted);
+        }
+        if env.ledger().timestamp() > proposal.expires_at {
+            return Err(KoraError::ProposalExpired);
+        }
+        if proposal.approvals.len() < config.threshold {
+            return Err(KoraError::ThresholdNotMet);
+        }
+
+        proposal.executed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        match proposal.action {
+            AdminAction::Pause => {
+                env.storage().instance().set(&DataKey::Paused, &true);
+                events::protocol_paused(&env, &executor);
+            }
+            AdminAction::Unpause => {
+                env.storage().instance().set(&DataKey::Paused, &false);
+                events::protocol_unpaused(&env, &executor);
+            }
+            AdminAction::GrantRole(target, role_val) => {
+                let role = match role_val {
+                    1 => Role::Operator,
+                    2 => Role::Verifier,
+                    _ => return Err(KoraError::Unauthorized),
+                };
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Role(target.clone()), &role);
+                Self::bump_persistent(&env, &DataKey::Role(target.clone()));
+                events::role_granted(&env, &executor, &target);
+            }
+            AdminAction::RevokeRole(target) => {
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::Role(target.clone()));
+                events::role_revoked(&env, &executor, &target);
+            }
+            AdminAction::TransferAdmin(new_admin) => {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Admin, &new_admin);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Role(new_admin.clone()), &Role::Admin);
+                Self::bump_persistent(&env, &DataKey::Role(new_admin.clone()));
+                events::admin_transferred(&env, &new_admin);
+            }
+        }
+
+        events::action_executed(&env, proposal_id, &executor);
+        Ok(())
+    }
+
+    /// Get a proposal by ID.
+    pub fn get_proposal(env: Env, proposal_id: u64) -> Result<Proposal, KoraError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(KoraError::ProposalNotFound)
+    }
+
+    /// Get the current multisig configuration.
+    pub fn get_multisig_config(env: Env) -> Result<MultisigConfig, KoraError> {
+        Self::load_multisig_config(&env)
+    }
+
     // ── Views ─────────────────────────────────────────────────────────────────
 
     /// Returns `true` if the protocol is currently paused.
@@ -234,6 +452,39 @@ impl AccessControlContract {
             .ok_or(KoraError::NotInitialized)
     }
 
+    // ── Upgrade ────────────────────────────────────────────────────────────────
+
+    pub fn propose_upgrade(
+        env: Env,
+        admin: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeProposal, &(new_wasm_hash.clone(), env.ledger().timestamp()));
+        events::upgrade_proposed(&env, &admin, &new_wasm_hash);
+        Ok(())
+    }
+
+    pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let (wasm_hash, proposed_at): (BytesN<32>, u64) = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeProposal)
+            .ok_or(KoraError::NoUpgradeProposed)?;
+        if env.ledger().timestamp() < proposed_at + UPGRADE_TIMELOCK_DELAY {
+            return Err(KoraError::UpgradeTimelockNotElapsed);
+        }
+        env.storage().instance().remove(&DataKey::UpgradeProposal);
+        events::upgrade_executed(&env, &admin, &wasm_hash);
+        env.deployer().update_current_contract_wasm(wasm_hash);
+        Ok(())
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     /// Read the paused flag from persistent storage.
@@ -260,6 +511,22 @@ impl AccessControlContract {
         env.storage()
             .persistent()
             .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_BUMP);
+    }
+
+    fn load_multisig_config(env: &Env) -> Result<MultisigConfig, KoraError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MultisigConfig)
+            .ok_or(KoraError::MultisigNotConfigured)
+    }
+
+    fn require_signer(config: &MultisigConfig, caller: &Address) -> Result<(), KoraError> {
+        for i in 0..config.signers.len() {
+            if &config.signers.get(i).unwrap() == caller {
+                return Ok(());
+            }
+        }
+        Err(KoraError::SignerNotFound)
     }
 }
 
