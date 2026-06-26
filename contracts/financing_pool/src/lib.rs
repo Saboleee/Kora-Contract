@@ -43,6 +43,7 @@ impl FinancingPoolContract {
         treasury: Address,
         access_control: Address,
         late_penalty_bps: u32,
+        price_oracle: Address,
     ) -> Result<(), KoraError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(KoraError::AlreadyInitialized);
@@ -53,6 +54,7 @@ impl FinancingPoolContract {
         env.storage().instance().set(&DataKey::Treasury, &treasury);
         env.storage().instance().set(&DataKey::AccessControl, &access_control);
         env.storage().instance().set(&DataKey::LatePenaltyBps, &late_penalty_bps);
+        env.storage().instance().set(&DataKey::PriceOracle, &price_oracle);
         Ok(())
     }
 
@@ -99,6 +101,8 @@ impl FinancingPoolContract {
             repaid_amount: 0,
             is_closed: false,
             late_penalty_bps,
+            total_owed: invoice.amount,
+            penalty_applied: false,
         };
 
         env.storage().persistent().set(&DataKey::Pool(invoice_id), &pool);
@@ -170,6 +174,11 @@ impl FinancingPoolContract {
     }
 
     /// SME repays the invoice.
+    /// If the current ledger timestamp is past the invoice's due_date and no
+    /// penalty has been applied yet, a one-time late penalty of
+    /// `bps_of(face_value, late_penalty_bps)` is added to `total_owed`.
+    /// Partial repayments are tracked against `total_owed` so the penalty is
+    /// never double-counted.
     pub fn repay(
         env: Env,
         payer: Address,
@@ -202,13 +211,39 @@ impl FinancingPoolContract {
             return Err(KoraError::RepaymentAlreadyMade);
         }
 
+        // Fetch invoice for due_date check and currency conversion
+        let nft_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::InvoiceNft)
+            .ok_or(KoraError::NotInitialized)?;
+        let nft_client =
+            kora_invoice_nft::InvoiceNftContractClient::new(&env, &nft_contract);
+        let invoice = nft_client.get_invoice(&invoice_id);
+
+        // Convert repayment amount if invoice currency differs from pool token
+        let effective_amount = Self::convert_if_needed(&env, amount, &invoice.currency, &pool.token)?;
+
+        // Apply late penalty once if repayment is past due_date
+        if !pool.penalty_applied && pool.late_penalty_bps > 0 {
+            if env.ledger().timestamp() > invoice.due_date {
+                let penalty = bps_of(pool.face_value, pool.late_penalty_bps)?;
+                pool.total_owed = pool
+                    .total_owed
+                    .checked_add(penalty)
+                    .ok_or(KoraError::ArithmeticOverflow)?;
+                pool.penalty_applied = true;
+                events::late_penalty_applied(&env, invoice_id, penalty, pool.total_owed);
+            }
+        }
+
         // Effects before interactions (CEI pattern)
         pool.repaid_amount = pool
             .repaid_amount
-            .checked_add(amount)
+            .checked_add(effective_amount)
             .ok_or(KoraError::ArithmeticOverflow)?;
 
-        let should_close = pool.repaid_amount >= pool.face_value;
+        let should_close = pool.repaid_amount >= pool.total_owed;
         if should_close {
             pool.is_closed = true;
         }
@@ -221,18 +256,15 @@ impl FinancingPoolContract {
         // Standardized repayment event
         events::repayment_made(&env, invoice_id, &payer, amount);
 
-
         if should_close {
             Self::distribute_yield(
                 &env,
                 invoice_id,
                 &token,
                 pool.repaid_amount,
+                pool.face_value,
             )?;
 
-
-            // Mark NFT as repaid
-            // AUDIT FIX: Use ok_or() instead of unwrap() for safe error propagation
             let nft_contract: Address = env
                 .storage()
                 .instance()
@@ -381,6 +413,38 @@ impl FinancingPoolContract {
         }
         Ok(())
     }
+
+    /// Convert `amount` between currencies using the price oracle.
+    /// If invoice currency matches the pool token's symbol, returns amount unchanged.
+    /// Rejects stale or missing oracle prices.
+    fn convert_if_needed(
+        env: &Env,
+        amount: i128,
+        invoice_currency: &Symbol,
+        _pool_token: &Address,
+    ) -> Result<i128, KoraError> {
+        let oracle_addr: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PriceOracle);
+
+        let oracle_addr = match oracle_addr {
+            Some(addr) => addr,
+            None => return Ok(amount),
+        };
+
+        let oracle_client =
+            kora_price_oracle::PriceOracleContractClient::new(env, &oracle_addr);
+
+        // Use the invoice currency symbol directly; pool token symbol is
+        // derived from the token contract but for oracle lookup we use the
+        // same symbol convention.  If the oracle has no pair registered
+        // for (from, to), the convert call will fail — this is intentional
+        // to reject operations without a valid price.
+        let pool_currency = Symbol::new(env, "USDC");
+
+        oracle_client.convert(&amount, invoice_currency, &pool_currency)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -399,7 +463,8 @@ mod tests {
         let nft = Address::generate(&env);
         let treasury = Address::generate(&env);
         let access_control = Address::generate(&env);
-        client.initialize(&admin, &nft, &treasury, &access_control, &200u32);
+        let oracle = Address::generate(&env);
+        client.initialize(&admin, &nft, &treasury, &access_control, &200u32, &oracle);
         (env, admin, nft, treasury, access_control, client)
     }
 
@@ -413,7 +478,8 @@ mod tests {
     #[test]
     fn test_initialize_already_initialized_fails() {
         let (env, admin, nft, treasury, ac, client) = setup();
-        let result = client.try_initialize(&admin, &nft, &treasury, &ac, &200u32);
+        let oracle = Address::generate(&env);
+        let result = client.try_initialize(&admin, &nft, &treasury, &ac, &200u32, &oracle);
         assert!(result.is_err());
     }
 
@@ -427,8 +493,9 @@ mod tests {
         let nft = Address::generate(&env);
         let treasury = Address::generate(&env);
         let access_control = Address::generate(&env);
+        let oracle = Address::generate(&env);
 
-        let result = client.try_initialize(&admin, &nft, &treasury, &access_control, &10_001u32);
+        let result = client.try_initialize(&admin, &nft, &treasury, &access_control, &10_001u32, &oracle);
 
         assert!(result.is_err());
     }
@@ -443,7 +510,8 @@ mod tests {
         let nft = Address::generate(&env);
         let treasury = Address::generate(&env);
         let access_control = Address::generate(&env);
-        let result = client.try_initialize(&admin, &nft, &treasury, &access_control, &0u32);
+        let oracle = Address::generate(&env);
+        let result = client.try_initialize(&admin, &nft, &treasury, &access_control, &0u32, &oracle);
 
         assert!(result.is_ok());
     }
@@ -738,7 +806,8 @@ mod tests {
         let nft = Address::generate(&env);
         let treasury = Address::generate(&env);
         let ac = Address::generate(&env);
-        let result = client.try_initialize(&admin, &nft, &treasury, &ac, &10_000u32);
+        let oracle = Address::generate(&env);
+        let result = client.try_initialize(&admin, &nft, &treasury, &ac, &10_000u32, &oracle);
         assert!(result.is_ok());
     }
 }

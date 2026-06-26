@@ -471,7 +471,8 @@ mod tests {
         let pool_id = env.register_contract(None, FinancingPoolContract);
         let pool_client = FinancingPoolContractClient::new(&env, &pool_id);
         let ac2 = Address::generate(&env);
-        pool_client.initialize(&admin, &nft_id, &treasury, &ac2, &200u32);
+        let oracle = Address::generate(&env);
+        pool_client.initialize(&admin, &nft_id, &treasury, &ac2, &200u32, &oracle);
 
         let mp_id = env.register_contract(None, MarketplaceContract);
         let mp = MarketplaceContractClient::new(&env, &mp_id);
@@ -1098,5 +1099,22 @@ mod tests {
         // asking_price = 9_500_000_000; any amount > that is rejected before overflow
         let result = t.mp.try_fund_invoice(&investor, &id, &i128::MAX);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_fund_cancelled_listing() {
+        let t = deploy();
+        let id = list_one(&t);
+
+        t.mp.cancel_listing(&t.seller, &id);
+        let listing = t.mp.get_listing(&id);
+        assert!(!listing.is_active);
+
+        let investor = Address::generate(&t.env);
+        let result = t.mp.try_fund_invoice(&investor, &id, &1_000_000i128);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            KoraError::ListingAlreadyCancelled
+        );
     }
 }

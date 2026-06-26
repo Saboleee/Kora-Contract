@@ -78,6 +78,14 @@ pub fn yield_distributed(env: &Env, invoice_id: u64, investor: &Address, yield_a
     );
 }
 
+pub fn late_penalty_applied(env: &Env, invoice_id: u64, penalty_amount: i128, total_owed: i128) {
+    emit(
+        env,
+        symbol_short!("LATE_PEN"),
+        (invoice_id, penalty_amount, total_owed, env.ledger().timestamp()),
+    );
+}
+
 // ── Marketplace Events ──────────────────────────────────────────────────────
 
 pub fn listing_cancelled(env: &Env, invoice_id: u64, seller: &Address) {

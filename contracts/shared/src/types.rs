@@ -91,6 +91,8 @@ pub struct Pool {
     pub repaid_amount: i128,
     pub is_closed: bool,
     pub late_penalty_bps: u32,
+    pub total_owed: i128,
+    pub penalty_applied: bool,
 }
 
 /// Protocol-level configuration.

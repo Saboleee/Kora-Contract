@@ -7,6 +7,7 @@ members = [
     "contracts/treasury",
     "contracts/risk_registry",
     "contracts/access_control",
+    "contracts/price_oracle",
     "contracts/tests",
 ]
 resolver = "2"
