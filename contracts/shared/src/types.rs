@@ -23,6 +23,8 @@ pub enum RiskTier {
 }
 
 impl RiskTier {
+    /// OPT: Mark for inlining - simple range-based match, called frequently during minting
+    #[inline]
     pub fn from_score(score: u32) -> RiskTier {
         match score {
             0..=20 => RiskTier::AAA,
@@ -40,12 +42,12 @@ impl RiskTier {
 pub struct Invoice {
     pub id: u64,
     pub sme: Address,
-    pub debtor_hash: Bytes,    // keccak/sha256 of debtor info — PII stays off-chain
-    pub amount: i128,          // face value in stroops (7 decimals)
-    pub currency: Symbol,      // e.g. USDC, EURC
-    pub due_date: u64,         // Unix timestamp
-    pub ipfs_cid: String,      // IPFS CID of full invoice metadata
-    pub risk_score: u32,       // 0–100
+    pub debtor_hash: Bytes, // keccak/sha256 of debtor info — PII stays off-chain
+    pub amount: i128,       // face value in stroops (7 decimals)
+    pub currency: Symbol,   // e.g. USDC, EURC
+    pub due_date: u64,      // Unix timestamp
+    pub ipfs_cid: String,   // IPFS CID of full invoice metadata
+    pub risk_score: u32,    // 0–100
     pub risk_tier: RiskTier,
     pub status: InvoiceStatus,
     pub created_at: u64,
@@ -59,9 +61,9 @@ pub struct Invoice {
 pub struct Listing {
     pub invoice_id: u64,
     pub seller: Address,
-    pub asking_price: i128,    // discounted price investors pay
-    pub face_value: i128,      // full repayment amount
-    pub token: Address,        // whitelisted stablecoin
+    pub asking_price: i128, // discounted price investors pay
+    pub face_value: i128,   // full repayment amount
+    pub token: Address,     // whitelisted stablecoin
     pub funded_amount: i128,
     pub funding_deadline: u64,
     pub is_active: bool,
@@ -74,7 +76,7 @@ pub struct Position {
     pub investor: Address,
     pub invoice_id: u64,
     pub contributed: i128,
-    pub share_bps: u32,        // basis points of total pool (10000 = 100%)
+    pub share_bps: u32, // basis points of total pool (10000 = 100%)
     pub yield_claimed: i128,
 }
 
@@ -91,15 +93,17 @@ pub struct Pool {
     pub late_penalty_bps: u32,
 }
 
-/// Protocol-level configuration
+/// Protocol-level configuration.
+///
+/// Note: pause state is NOT stored here — it is owned exclusively by the
+/// AccessControl contract to avoid split-brain between two sources of truth.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct ProtocolConfig {
-    pub fee_bps: u32,           // protocol fee in basis points (e.g. 50 = 0.5%)
-    pub late_penalty_bps: u32,  // penalty on late repayment
-    pub max_risk_score: u32,    // ceiling for accepted invoices
+    pub fee_bps: u32,          // protocol fee in basis points (e.g. 50 = 0.5%)
+    pub late_penalty_bps: u32, // penalty on late repayment
+    pub max_risk_score: u32,   // ceiling for accepted invoices
     pub min_funding_period: u64,
-    pub paused: bool,
 }
 
 /// SME profile in the risk registry
