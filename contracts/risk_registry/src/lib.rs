@@ -861,13 +861,14 @@ mod tests {
         env.mock_all_auths();
         let contract_id = env.register_contract(None, RiskRegistryContract);
         let client = RiskRegistryContractClient::new(&env, &contract_id);
-        let result = client.try_initialize(&contract_id);
+        let invoice_nft = Address::generate(&env);
+        let result = client.try_initialize(&contract_id, &invoice_nft);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_add_verifier_self_as_verifier_rejected() {
-        let (env, admin, client) = setup();
+        let (env, admin, _, client) = setup();
         let contract_id = client.address.clone();
         let result = client.try_add_verifier(&admin, &contract_id);
         assert!(result.is_err());
