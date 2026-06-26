@@ -27,6 +27,10 @@ pub enum DataKey {
     FeeBps,
     Listing(u64),
     WhitelistedToken(Address),
+    /// Tracks net contribution (amount sent to pool) per investor per listing.
+    Contribution(u64, Address),
+    /// Tracks whether an investor has claimed their refund for an expired listing.
+    RefundClaimed(u64, Address),
 }
 
 // ── Config struct ─────────────────────────────────────────────────────────────
@@ -243,6 +247,17 @@ impl MarketplaceContract {
 
         listing.funded_amount = safe_add(listing.funded_amount, amount)?;
 
+        // Track per-investor net contribution for potential refund
+        let contrib_key = DataKey::Contribution(invoice_id, investor.clone());
+        let prev_contrib: i128 = env
+            .storage()
+            .persistent()
+            .get(&contrib_key)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&contrib_key, &safe_add(prev_contrib, net)?);
+
         let fully_funded = listing.funded_amount >= listing.asking_price;
         if fully_funded {
             listing.is_active = false;
@@ -297,6 +312,67 @@ impl MarketplaceContract {
         Self::bump_persistent(&env, &DataKey::Listing(invoice_id));
 
         events::listing_cancelled(&env, invoice_id, &listing.seller);
+        Ok(())
+    }
+
+    /// Claim a refund for a listing that expired without reaching full funding.
+    /// The investor gets back the net amount (after fee) that was sent to the
+    /// financing pool. Fees already collected by the treasury are not refunded.
+    pub fn claim_refund(
+        env: Env,
+        investor: Address,
+        invoice_id: u64,
+    ) -> Result<(), KoraError> {
+        investor.require_auth();
+
+        let listing: Listing = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Listing(invoice_id))
+            .ok_or(KoraError::ListingNotFound)?;
+
+        // Refund only if the listing is still partially funded (not fully funded)
+        if listing.funded_amount >= listing.asking_price {
+            return Err(KoraError::ListingFullyFunded);
+        }
+
+        // Refund only after the funding deadline has passed
+        if env.ledger().timestamp() <= listing.funding_deadline {
+            return Err(KoraError::FundingNotExpired);
+        }
+
+        // Check the investor hasn't already claimed
+        let refund_key = DataKey::RefundClaimed(invoice_id, investor.clone());
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&refund_key)
+            .unwrap_or(false)
+        {
+            return Err(KoraError::RefundAlreadyClaimed);
+        }
+
+        // Look up the investor's net contribution
+        let contrib_key = DataKey::Contribution(invoice_id, investor.clone());
+        let net_contributed: i128 = env
+            .storage()
+            .persistent()
+            .get(&contrib_key)
+            .unwrap_or(0);
+
+        if net_contributed <= 0 {
+            return Err(KoraError::NoContribution);
+        }
+
+        // Mark refund as claimed before interaction (CEI pattern)
+        env.storage().persistent().set(&refund_key, &true);
+
+        // Transfer the net contribution back from financing pool to investor
+        let config = Self::load_config(&env)?;
+        let token_client = token::Client::new(&env, &listing.token);
+        token_client.transfer(&config.financing_pool, &investor, &net_contributed);
+
+        events::refund_claimed(&env, invoice_id, &investor, net_contributed);
         Ok(())
     }
 

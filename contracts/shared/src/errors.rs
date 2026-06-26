@@ -69,4 +69,10 @@ pub enum KoraError {
     SignerAlreadyExists = 106,
     SignerNotFound = 107,
     MultisigNotConfigured = 108,
+
+    // Refund
+    FundingNotExpired = 110,
+    ListingFullyFunded = 111,
+    NoContribution = 112,
+    RefundAlreadyClaimed = 113,
 }

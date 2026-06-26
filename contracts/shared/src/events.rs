@@ -355,3 +355,18 @@ pub fn action_executed(env: &Env, proposal_id: u64, executor: &Address) {
         (proposal_id, executor.clone(), env.ledger().timestamp()),
     );
 }
+
+// ── Refund Events ────────────────────────────────────────────────────────────
+
+pub fn refund_claimed(env: &Env, invoice_id: u64, investor: &Address, amount: i128) {
+    emit(
+        env,
+        symbol_short!("REFUND"),
+        (
+            invoice_id,
+            investor.clone(),
+            amount,
+            env.ledger().timestamp(),
+        ),
+    );
+}
