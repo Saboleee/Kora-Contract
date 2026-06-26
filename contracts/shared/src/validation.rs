@@ -1,6 +1,5 @@
 use soroban_sdk::{Address, Bytes, Env, String};
 use crate::errors::KoraError;
-use soroban_sdk::{Bytes, Env, String};
 
 /// Minimum timelock delay for upgrade proposals (24 hours in seconds).
 pub const UPGRADE_TIMELOCK_DELAY: u64 = 86_400;
