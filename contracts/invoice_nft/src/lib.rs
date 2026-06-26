@@ -201,9 +201,16 @@ impl InvoiceNftContract {
     }
 
     fn require_not_paused(env: &Env) -> Result<(), KoraError> {
-        // Reads paused flag stored by AccessControl contract via cross-contract call
-        // For now, local guard — AccessControl integration wired at deployment
-        let _ = env;
+        if let Some(ac_contract) = env
+            .storage()
+            .instance()
+            .get::<DataKey, soroban_sdk::Address>(&DataKey::AccessControl)
+        {
+            let ac = kora_access_control::AccessControlContractClient::new(env, &ac_contract);
+            if ac.is_paused() {
+                return Err(KoraError::ProtocolPaused);
+            }
+        }
         Ok(())
     }
 }

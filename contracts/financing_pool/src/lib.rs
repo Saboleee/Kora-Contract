@@ -16,6 +16,7 @@ pub enum DataKey {
     Admin,
     InvoiceNft,
     RiskRegistry,
+    AccessControl,
     Treasury,
     LatePenaltyBps,
     RepaymentLock(u64), // Reentrancy guard: tracks if repayment is in progress
@@ -35,6 +36,7 @@ impl FinancingPoolContract {
         risk_registry: Address,
         treasury: Address,
         late_penalty_bps: u32,
+        access_control: Address,
     ) -> Result<(), KoraError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(KoraError::AlreadyInitialized);
@@ -47,6 +49,9 @@ impl FinancingPoolContract {
         env.storage()
             .instance()
             .set(&DataKey::RiskRegistry, &risk_registry);
+        env.storage()
+            .instance()
+            .set(&DataKey::AccessControl, &access_control);
         env.storage().instance().set(&DataKey::Treasury, &treasury);
         env.storage()
             .instance()
@@ -109,6 +114,7 @@ impl FinancingPoolContract {
     ) -> Result<(), KoraError> {
         caller.require_auth();
         Self::require_admin(&env, &caller)?;
+        Self::require_not_paused(&env)?;
 
         if contributed <= 0 || total_pool <= 0 {
             return Err(KoraError::InvalidAmount);
@@ -239,8 +245,7 @@ impl FinancingPoolContract {
     ) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
-
-        // Check reentrancy guard
+        Self::require_not_paused(&env)?;
         if env.storage().persistent().has(&DataKey::RepaymentLock(invoice_id)) {
             return Err(KoraError::ProtocolPaused);
         }
@@ -309,6 +314,20 @@ impl FinancingPoolContract {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    fn require_not_paused(env: &Env) -> Result<(), KoraError> {
+        if let Some(ac_contract) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::AccessControl)
+        {
+            let ac = kora_access_control::AccessControlContractClient::new(env, &ac_contract);
+            if ac.is_paused() {
+                return Err(KoraError::ProtocolPaused);
+            }
+        }
+        Ok(())
+    }
+
     fn require_admin(env: &Env, caller: &Address) -> Result<(), KoraError> {
         let admin: Address = env
             .storage()
@@ -339,7 +358,8 @@ mod tests {
         let nft = Address::generate(&env);
         let risk_registry = Address::generate(&env);
         let treasury = Address::generate(&env);
-        client.initialize(&admin, &nft, &risk_registry, &treasury, &200u32);
+        let access_control = Address::generate(&env);
+        client.initialize(&admin, &nft, &risk_registry, &treasury, &200u32, &access_control);
         (env, admin, nft, treasury, client)
     }
 
@@ -354,7 +374,8 @@ mod tests {
     fn test_initialize_already_initialized_fails() {
         let (env, admin, nft, treasury, client) = setup();
         let rr = Address::generate(&env);
-        let result = client.try_initialize(&admin, &nft, &rr, &treasury, &200u32);
+        let ac = Address::generate(&env);
+        let result = client.try_initialize(&admin, &nft, &rr, &treasury, &200u32, &ac);
         assert!(result.is_err());
     }
 
@@ -369,8 +390,9 @@ mod tests {
         let nft = Address::generate(&env);
         let rr = Address::generate(&env);
         let treasury = Address::generate(&env);
-        
-        let result = client.try_initialize(&admin, &nft, &rr, &treasury, &10_001u32);
+        let ac = Address::generate(&env);
+
+        let result = client.try_initialize(&admin, &nft, &rr, &treasury, &10_001u32, &ac);
         assert!(result.is_err());
     }
 

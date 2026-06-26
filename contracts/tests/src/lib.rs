@@ -66,8 +66,8 @@ mod integration {
         // Initialize all contracts
         ac.initialize(&admin);
         nft.initialize(&admin, &ac_id);
-        mp.initialize(&admin, &nft_id, &pool_id, &treasury_id, &50u32);
-        pool.initialize(&admin, &nft_id, &rr_id, &treasury_id, &200u32);
+        mp.initialize(&admin, &nft_id, &pool_id, &treasury_id, &50u32, &ac_id);
+        pool.initialize(&admin, &nft_id, &rr_id, &treasury_id, &200u32, &ac_id);
         treasury.initialize(&admin, &50u32);
         rr.initialize(&admin);
 
@@ -377,7 +377,125 @@ mod integration {
         );
     }
 
-    /// Sequential invoice IDs are assigned correctly.
+    /// Pause enforcement matrix: pausing the protocol blocks all state-mutating
+    /// entrypoints on invoice_nft, marketplace, and financing_pool.
+    /// financing_pool.repay is intentionally exempt so funded SMEs can still
+    /// repay even during an emergency pause.
+    ///
+    /// Enforcement matrix:
+    /// | Entrypoint                        | Paused blocks? |
+    /// |-----------------------------------|----------------|
+    /// | invoice_nft::mint_invoice         | YES            |
+    /// | invoice_nft::set_listed           | YES            |
+    /// | invoice_nft::set_funded           | YES            |
+    /// | marketplace::list_invoice         | YES            |
+    /// | marketplace::fund_invoice         | YES            |
+    /// | financing_pool::record_position   | YES            |
+    /// | financing_pool::mark_default      | YES            |
+    /// | financing_pool::repay             | NO (exempt)    |
+    #[test]
+    fn test_pause_enforcement_matrix() {
+        use kora_shared::errors::KoraError;
+
+        let k = deploy_protocol();
+        let (debtor_hash, amount, currency, due_date, ipfs_cid, risk_score) =
+            sample_invoice_params(&k.env);
+
+        let sme = Address::generate(&k.env);
+        let investor = Address::generate(&k.env);
+
+        // Mint a valid invoice and get it to Listed+Funded state before pausing,
+        // so we have invoices to test transitions against while paused.
+        let invoice_id = k.invoice_nft.mint_invoice(
+            &sme, &debtor_hash, &amount, &currency, &due_date, &ipfs_cid, &risk_score,
+        );
+        k.invoice_nft.set_listed(&k.marketplace.address, &invoice_id);
+        k.invoice_nft.set_funded(&k.pool.address, &invoice_id);
+
+        // Mint a second invoice that stays in Created state for listed-gate testing
+        let invoice_id2 = k.invoice_nft.mint_invoice(
+            &sme, &debtor_hash, &amount, &currency, &due_date, &ipfs_cid, &risk_score,
+        );
+
+        // ── Pause the protocol ────────────────────────────────────────────────
+        k.access_control.pause(&k.admin);
+        assert!(k.access_control.is_paused());
+
+        // ── invoice_nft::mint_invoice blocked ─────────────────────────────────
+        let r = k.invoice_nft.try_mint_invoice(
+            &sme, &debtor_hash, &amount, &currency, &due_date, &ipfs_cid, &risk_score,
+        );
+        assert!(r.is_err(), "mint_invoice must be blocked when paused");
+        assert_eq!(
+            r.unwrap_err().unwrap(),
+            KoraError::ProtocolPaused
+        );
+
+        // ── invoice_nft::set_listed blocked ───────────────────────────────────
+        let r = k.invoice_nft.try_set_listed(&k.marketplace.address, &invoice_id2);
+        assert!(r.is_err(), "set_listed must be blocked when paused");
+        assert_eq!(r.unwrap_err().unwrap(), KoraError::ProtocolPaused);
+
+        // ── invoice_nft::set_funded blocked ───────────────────────────────────
+        // invoice_id2 is still Created; set_listed would fail with pause,
+        // so use a fresh invoice that we manually put in Listed state
+        // via direct storage — instead just test with invoice_id2 which is Created:
+        // set_funded requires Listed, so it would return InvalidInvoiceStatus after pause check.
+        // To test the pause gate specifically, we need it to reach the pause check first.
+        // set_funded also calls require_not_paused before status check — test it:
+        let r = k.invoice_nft.try_set_funded(&k.pool.address, &invoice_id2);
+        assert!(r.is_err(), "set_funded must be blocked when paused");
+        assert_eq!(r.unwrap_err().unwrap(), KoraError::ProtocolPaused);
+
+        // ── marketplace::list_invoice blocked ─────────────────────────────────
+        let funding_deadline = k.env.ledger().timestamp() + 86_400 * 30;
+        // Need a whitelisted token — use a dummy address; it will fail at pause check first
+        let dummy_token = Address::generate(&k.env);
+        let r = k.marketplace.try_list_invoice(
+            &sme, &invoice_id2, &(amount - 1), &amount, &dummy_token, &funding_deadline,
+        );
+        assert!(r.is_err(), "list_invoice must be blocked when paused");
+        assert_eq!(r.unwrap_err().unwrap(), KoraError::ProtocolPaused);
+
+        // ── marketplace::fund_invoice blocked ─────────────────────────────────
+        let r = k.marketplace.try_fund_invoice(&investor, &invoice_id, &1_000i128);
+        assert!(r.is_err(), "fund_invoice must be blocked when paused");
+        assert_eq!(r.unwrap_err().unwrap(), KoraError::ProtocolPaused);
+
+        // ── financing_pool::record_position blocked ───────────────────────────
+        let r = k.pool.try_record_position(
+            &k.admin, &invoice_id, &investor, &5_000_000_000i128, &10_000_000_000i128,
+        );
+        assert!(r.is_err(), "record_position must be blocked when paused");
+        assert_eq!(r.unwrap_err().unwrap(), KoraError::ProtocolPaused);
+
+        // ── financing_pool::mark_default blocked ──────────────────────────────
+        let dummy_token2 = Address::generate(&k.env);
+        let r = k.pool.try_mark_default(&k.admin, &invoice_id, &dummy_token2);
+        assert!(r.is_err(), "mark_default must be blocked when paused");
+        assert_eq!(r.unwrap_err().unwrap(), KoraError::ProtocolPaused);
+
+        // ── financing_pool::repay is EXEMPT from pause ────────────────────────
+        // repay will fail with PoolNotFound (no pool exists for invoice_id here
+        // in unit-test mode) — but NOT with ProtocolPaused, proving the gate is absent.
+        let r = k.pool.try_repay(&sme, &999u64, &dummy_token2, &1_000i128);
+        assert!(r.is_err());
+        assert_ne!(
+            r.unwrap_err().unwrap(),
+            KoraError::ProtocolPaused,
+            "repay must NOT be blocked by pause — it is intentionally exempt"
+        );
+
+        // ── Unpause restores normal operation ─────────────────────────────────
+        k.access_control.unpause(&k.admin);
+        assert!(!k.access_control.is_paused());
+
+        // mint works again after unpause
+        let r = k.invoice_nft.try_mint_invoice(
+            &sme, &debtor_hash, &amount, &currency, &due_date, &ipfs_cid, &risk_score,
+        );
+        assert!(r.is_ok(), "mint_invoice must succeed after unpause");
+    }
     #[test]
     fn test_sequential_invoice_ids() {
         let k = deploy_protocol();

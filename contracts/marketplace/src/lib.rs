@@ -21,6 +21,7 @@ pub enum DataKey {
     Treasury,
     FeeBps,
     WhitelistedToken(Address),
+    AccessControl,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -37,6 +38,7 @@ impl MarketplaceContract {
         financing_pool: Address,
         treasury: Address,
         fee_bps: u32,
+        access_control: Address,
     ) -> Result<(), KoraError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(KoraError::AlreadyInitialized);
@@ -47,6 +49,7 @@ impl MarketplaceContract {
         env.storage().instance().set(&DataKey::FinancingPool, &financing_pool);
         env.storage().instance().set(&DataKey::Treasury, &treasury);
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
+        env.storage().instance().set(&DataKey::AccessControl, &access_control);
         Ok(())
     }
 
@@ -61,6 +64,7 @@ impl MarketplaceContract {
         funding_deadline: u64,
     ) -> Result<(), KoraError> {
         seller.require_auth();
+        Self::require_not_paused(&env)?;
         require_non_zero_amount(asking_price)?;
         require_non_zero_amount(face_value)?;
         kora_shared::validation::require_future_timestamp(&env, funding_deadline)?;
@@ -102,6 +106,7 @@ impl MarketplaceContract {
         amount: i128,
     ) -> Result<(), KoraError> {
         investor.require_auth();
+        Self::require_not_paused(&env)?;
         require_non_zero_amount(amount)?;
 
         let mut listing: Listing = env
@@ -203,6 +208,20 @@ impl MarketplaceContract {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    fn require_not_paused(env: &Env) -> Result<(), KoraError> {
+        if let Some(ac_contract) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::AccessControl)
+        {
+            let ac = kora_access_control::AccessControlContractClient::new(env, &ac_contract);
+            if ac.is_paused() {
+                return Err(KoraError::ProtocolPaused);
+            }
+        }
+        Ok(())
+    }
+
     fn require_whitelisted_token(env: &Env, token: &Address) -> Result<(), KoraError> {
         let ok: bool = env
             .storage()
@@ -245,7 +264,8 @@ mod tests {
         let nft = Address::generate(&env);
         let pool = Address::generate(&env);
         let treasury = Address::generate(&env);
-        client.initialize(&admin, &nft, &pool, &treasury, &50u32);
+        let access_control = Address::generate(&env);
+        client.initialize(&admin, &nft, &pool, &treasury, &50u32, &access_control);
         (env, admin, nft, pool, treasury, client)
     }
 
