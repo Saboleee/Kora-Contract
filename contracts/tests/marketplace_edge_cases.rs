@@ -68,7 +68,8 @@ mod marketplace_edge_cases {
         // Deploy Marketplace
         let mp_id = env.register_contract(None, kora_marketplace::MarketplaceContract);
         let mp = MarketplaceContractClient::new(&env, &mp_id);
-        mp.initialize(&admin, &nft_id, &pool_id, &treasury, &50u32);
+        let mp_ac = Address::generate(&env);
+        mp.initialize(&admin, &nft_id, &pool_id, &treasury, &mp_ac, &50u32);
 
         mp.whitelist_token(&admin, &token);
 
@@ -175,7 +176,8 @@ mod marketplace_edge_cases {
 
         let mp_id = env.register_contract(None, kora_marketplace::MarketplaceContract);
         let mp = MarketplaceContractClient::new(&env, &mp_id);
-        mp.initialize(&admin, &nft_id, &pool_id, &treasury, &0u32); // 0 fee
+        let mp_ac = Address::generate(&env);
+        mp.initialize(&admin, &nft_id, &pool_id, &treasury, &mp_ac, &0u32); // 0 fee
 
         mp.whitelist_token(&admin, &token);
 
@@ -227,7 +229,8 @@ mod marketplace_edge_cases {
 
         let mp_id = env.register_contract(None, kora_marketplace::MarketplaceContract);
         let mp = MarketplaceContractClient::new(&env, &mp_id);
-        mp.initialize(&admin, &nft_id, &pool_id, &treasury, &10_000u32); // 100% fee
+        let mp_ac = Address::generate(&env);
+        mp.initialize(&admin, &nft_id, &pool_id, &treasury, &mp_ac, &10_000u32); // 100% fee
 
         mp.whitelist_token(&admin, &token);
 

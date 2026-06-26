@@ -364,17 +364,16 @@ impl InvoiceNftContract {
         Ok(())
     }
 
-    /// Check the protocol pause flag stored in the AccessControl contract.
-    /// Falls back to unpaused if the AccessControl address is not set (e.g. in tests).
     fn require_not_paused(env: &Env) -> Result<(), KoraError> {
         let ac: Address = env
             .storage()
             .instance()
             .get(&DataKey::AccessControl)
             .ok_or(KoraError::NotInitialized)?;
-        let _ = ac;
-        // Cross-contract pause check wired at deployment via AccessControl contract.
-        // Local guard: no-op until cross-contract call is integrated.
+        let client = kora_access_control::AccessControlContractClient::new(env, &ac);
+        if client.is_paused() {
+            return Err(KoraError::ProtocolPaused);
+        }
         Ok(())
     }
 

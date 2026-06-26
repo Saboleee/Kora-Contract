@@ -24,6 +24,7 @@ pub enum DataKey {
     InvoiceNft,
     FinancingPool,
     Treasury,
+    AccessControl,
     FeeBps,
     Listing(u64),
     WhitelistedToken(Address),
@@ -39,6 +40,7 @@ pub struct MarketplaceConfig {
     pub invoice_nft: Address,
     pub financing_pool: Address,
     pub treasury: Address,
+    pub access_control: Address,
     pub fee_bps: u32,
 }
 
@@ -56,6 +58,7 @@ impl MarketplaceContract {
         invoice_nft: Address,
         financing_pool: Address,
         treasury: Address,
+        access_control: Address,
         fee_bps: u32,
     ) -> Result<(), KoraError> {
         if env.storage().instance().has(&DataKey::Config) {
@@ -67,6 +70,7 @@ impl MarketplaceContract {
             invoice_nft,
             financing_pool,
             treasury,
+            access_control,
             fee_bps,
         };
         env.storage().instance().set(&DataKey::Config, &config);
@@ -149,6 +153,7 @@ impl MarketplaceContract {
         funding_deadline: u64,
     ) -> Result<(), KoraError> {
         seller.require_auth();
+        Self::require_not_paused(&env)?;
 
         require_non_zero_amount(asking_price)?;
         require_non_zero_amount(face_value)?;
@@ -203,6 +208,7 @@ impl MarketplaceContract {
         amount: i128,
     ) -> Result<(), KoraError> {
         investor.require_auth();
+        Self::require_not_paused(&env)?;
 
         require_non_zero_amount(amount)?;
 
@@ -385,6 +391,11 @@ impl MarketplaceContract {
             .instance()
             .get(&DataKey::Treasury)
             .ok_or(KoraError::NotInitialized)?;
+        let access_control: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccessControl)
+            .ok_or(KoraError::NotInitialized)?;
         let fee_bps: u32 = env
             .storage()
             .instance()
@@ -396,16 +407,23 @@ impl MarketplaceContract {
             invoice_nft,
             financing_pool,
             treasury,
+            access_control,
             fee_bps,
         };
         env.storage().instance().set(&DataKey::Config, &config);
         Ok(config)
     }
 
-    /// Stub for protocol-pause integration. In production this would call
-    /// `access_control.is_paused()` via cross-contract call. The address is
-    /// stored at initialization time and the check is wired at deployment.
-    fn require_not_paused(_env: &Env) -> Result<(), KoraError> {
+    /// cancel_listing is intentionally exempt from the pause check: during an
+    /// emergency pause, sellers and admins must still be able to cancel active
+    /// listings, similar to how financing_pool::repay is pause-exempt.
+    fn require_not_paused(env: &Env) -> Result<(), KoraError> {
+        let config = Self::load_config(env)?;
+        let client =
+            kora_access_control::AccessControlContractClient::new(env, &config.access_control);
+        if client.is_paused() {
+            return Err(KoraError::ProtocolPaused);
+        }
         Ok(())
     }
 
@@ -474,9 +492,10 @@ mod tests {
         let oracle = Address::generate(&env);
         pool_client.initialize(&admin, &nft_id, &treasury, &ac2, &200u32, &oracle);
 
+        let mp_ac = Address::generate(&env);
         let mp_id = env.register_contract(None, MarketplaceContract);
         let mp = MarketplaceContractClient::new(&env, &mp_id);
-        mp.initialize(&admin, &nft_id, &pool_id, &treasury, &50u32);
+        mp.initialize(&admin, &nft_id, &pool_id, &treasury, &mp_ac, &50u32);
 
         let token = Address::generate(&env);
         mp.whitelist_token(&admin, &token);
@@ -531,6 +550,7 @@ mod tests {
             &Address::generate(&t.env),
             &Address::generate(&t.env),
             &Address::generate(&t.env),
+            &Address::generate(&t.env),
             &50u32,
         );
         assert_eq!(result.unwrap_err().unwrap(), KoraError::AlreadyInitialized);
@@ -543,6 +563,7 @@ mod tests {
         let mp_id = env.register_contract(None, MarketplaceContract);
         let mp = MarketplaceContractClient::new(&env, &mp_id);
         let result = mp.try_initialize(
+            &Address::generate(&env),
             &Address::generate(&env),
             &Address::generate(&env),
             &Address::generate(&env),
@@ -564,6 +585,7 @@ mod tests {
                 &Address::generate(&env),
                 &Address::generate(&env),
                 &Address::generate(&env),
+                &Address::generate(&env),
                 &0u32,
             )
             .is_ok());
@@ -577,6 +599,7 @@ mod tests {
         let mp = MarketplaceContractClient::new(&env, &mp_id);
         assert!(mp
             .try_initialize(
+                &Address::generate(&env),
                 &Address::generate(&env),
                 &Address::generate(&env),
                 &Address::generate(&env),
