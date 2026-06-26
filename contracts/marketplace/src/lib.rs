@@ -60,10 +60,18 @@ impl MarketplaceContract {
         treasury: Address,
         access_control: Address,
         fee_bps: u32,
+        access_control: Address,
     ) -> Result<(), KoraError> {
         if env.storage().instance().has(&DataKey::Config) {
             return Err(KoraError::AlreadyInitialized);
         }
+        kora_shared::validation::require_valid_fee_bps(fee_bps)?;
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::InvoiceNft, &invoice_nft);
+        env.storage().instance().set(&DataKey::FinancingPool, &financing_pool);
+        env.storage().instance().set(&DataKey::Treasury, &treasury);
+        env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
+        env.storage().instance().set(&DataKey::AccessControl, &access_control);
         require_valid_fee_bps(fee_bps)?;
         let config = MarketplaceConfig {
             admin,
@@ -388,6 +396,25 @@ impl MarketplaceContract {
             .ok_or(KoraError::ListingNotFound)
     }
 
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    fn require_not_paused(env: &Env) -> Result<(), KoraError> {
+        if let Some(ac_contract) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::AccessControl)
+        {
+            let ac = kora_access_control::AccessControlContractClient::new(env, &ac_contract);
+            if ac.is_paused() {
+                return Err(KoraError::ProtocolPaused);
+            }
+        }
+        Ok(())
+    }
+
+    fn require_whitelisted_token(env: &Env, token: &Address) -> Result<(), KoraError> {
+        let ok: bool = env
+            .storage()
     /// Returns whether a token is whitelisted.
     pub fn is_token_whitelisted(env: Env, token: Address) -> bool {
         env.storage()
@@ -552,6 +579,9 @@ mod tests {
 
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
+        let access_control = Address::generate(&env);
+        client.initialize(&admin, &nft, &pool, &treasury, &50u32, &access_control);
+        (env, admin, nft, pool, treasury, client)
 
         let nft_id = env.register_contract(None, InvoiceNftContract);
         let nft = InvoiceNftContractClient::new(&env, &nft_id);

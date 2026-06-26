@@ -365,6 +365,16 @@ impl InvoiceNftContract {
     }
 
     fn require_not_paused(env: &Env) -> Result<(), KoraError> {
+        if let Some(ac_contract) = env
+            .storage()
+            .instance()
+            .get::<DataKey, soroban_sdk::Address>(&DataKey::AccessControl)
+        {
+            let ac = kora_access_control::AccessControlContractClient::new(env, &ac_contract);
+            if ac.is_paused() {
+                return Err(KoraError::ProtocolPaused);
+            }
+        }
         let ac: Address = env
             .storage()
             .instance()

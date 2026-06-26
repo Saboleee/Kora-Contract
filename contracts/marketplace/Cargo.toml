@@ -10,6 +10,7 @@ crate-type = ["cdylib", "rlib"]
 soroban-sdk = { workspace = true }
 kora-shared = { path = "../shared" }
 kora-invoice-nft = { path = "../invoice_nft" }
+kora-access-control = { path = "../access_control" }
 kora-financing-pool = { path = "../financing_pool" }
 kora-access-control = { path = "../access_control" }
 
@@ -17,5 +18,6 @@ kora-access-control = { path = "../access_control" }
 soroban-sdk = { workspace = true, features = ["testutils"] }
 kora-shared = { path = "../shared" }
 kora-invoice-nft = { path = "../invoice_nft" }
+kora-access-control = { path = "../access_control" }
 kora-financing-pool = { path = "../financing_pool" }
 kora-access-control = { path = "../access_control" }

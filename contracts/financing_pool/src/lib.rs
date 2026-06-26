@@ -328,6 +328,7 @@ impl FinancingPoolContract {
     ) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        Self::require_not_paused(&env)?;
 
         if env.storage().persistent().has(&DataKey::RepaymentLock(invoice_id)) {
             return Err(KoraError::Unauthorized);
