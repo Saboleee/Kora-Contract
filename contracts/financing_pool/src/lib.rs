@@ -3,7 +3,7 @@
 use kora_shared::{
     errors::KoraError,
     events,
-    types::{Pool, Position},
+    types::{EarlySettlementOffer, Pool, Position},
     validation::{bps_of_normalized, UPGRADE_TIMELOCK_DELAY},
 };
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Map, Vec};
@@ -28,6 +28,7 @@ pub enum DataKey {
     AccessControl,
     RepaymentLock(u64),
     UpgradeProposal,
+    EarlySettlement(u64),
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -379,6 +380,218 @@ impl FinancingPoolContract {
         Ok(())
     }
 
+    // ── Early-Termination Buyout ────────────────────────────────────────────────
+
+    /// Propose an early-termination buyout of a funded invoice.
+    ///
+    /// The SME escrows `amount` (a negotiated discount to the full obligation) into the pool.
+    /// Investors then accept via `accept_early_settlement`; once investors representing 100% of
+    /// pool shares have accepted, the escrow is distributed pro-rata and the pool closes early.
+    ///
+    /// `amount` must satisfy `total_funded <= amount < total_owed` — investors recover at least
+    /// their principal, while the SME pays strictly less than the full obligation.
+    pub fn propose_early_settlement(
+        env: Env,
+        sme: Address,
+        invoice_id: u64,
+        amount: i128,
+    ) -> Result<(), KoraError> {
+        sme.require_auth();
+        Self::require_not_paused(&env)?;
+
+        if amount <= 0 || amount > MAX_AMOUNT {
+            return Err(KoraError::InvalidAmount);
+        }
+
+        let pool: Pool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Pool(invoice_id))
+            .ok_or(KoraError::PoolNotFound)?;
+        if pool.is_closed {
+            return Err(KoraError::PoolAlreadyClosed);
+        }
+        // Must be a genuine discount that still returns investors at least their principal.
+        if amount < pool.total_funded || amount >= pool.total_owed {
+            return Err(KoraError::InvalidAmount);
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::EarlySettlement(invoice_id))
+        {
+            return Err(KoraError::AlreadyInitialized);
+        }
+
+        // Only the invoice's SME may propose a buyout.
+        let invoice = Self::load_invoice(&env, invoice_id)?;
+        if invoice.sme != sme {
+            return Err(KoraError::Unauthorized);
+        }
+
+        // Escrow the buyout amount up-front so acceptance can settle atomically.
+        let token_client = token::Client::new(&env, &pool.token);
+        token_client.transfer(&sme, &env.current_contract_address(), &amount);
+
+        let offer = EarlySettlementOffer {
+            invoice_id,
+            amount,
+            accepted_bps: 0,
+            accepted: Vec::new(&env),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::EarlySettlement(invoice_id), &offer);
+        Ok(())
+    }
+
+    /// Accept a pending early-settlement offer as an investor in the pool.
+    ///
+    /// When investors representing 100% of pool shares have accepted, the escrowed amount is
+    /// distributed pro-rata to all investors, the pool is closed, and the invoice is marked repaid.
+    pub fn accept_early_settlement(
+        env: Env,
+        investor: Address,
+        invoice_id: u64,
+    ) -> Result<(), KoraError> {
+        investor.require_auth();
+        Self::require_not_paused(&env)?;
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::RepaymentLock(invoice_id))
+        {
+            return Err(KoraError::Unauthorized);
+        }
+
+        let mut offer: EarlySettlementOffer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EarlySettlement(invoice_id))
+            .ok_or(KoraError::PoolNotFound)?;
+
+        let mut pool: Pool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Pool(invoice_id))
+            .ok_or(KoraError::PoolNotFound)?;
+        if pool.is_closed {
+            return Err(KoraError::PoolAlreadyClosed);
+        }
+
+        let positions: Map<Address, Position> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Positions(invoice_id))
+            .unwrap_or_else(|| Map::new(&env));
+        let position = positions
+            .get(investor.clone())
+            .ok_or(KoraError::Unauthorized)?;
+
+        // An investor may only accept once.
+        if offer.accepted.iter().any(|a| a == investor) {
+            return Err(KoraError::AlreadyInitialized);
+        }
+        offer.accepted.push_back(investor.clone());
+        offer.accepted_bps = offer
+            .accepted_bps
+            .checked_add(position.share_bps)
+            .ok_or(KoraError::ArithmeticOverflow)?;
+
+        if offer.accepted_bps >= 10_000 {
+            // Unanimous acceptance: settle. Lock against a concurrent repay.
+            env.storage()
+                .persistent()
+                .set(&DataKey::RepaymentLock(invoice_id), &true);
+
+            pool.repaid_amount = offer.amount;
+            pool.is_closed = true;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Pool(invoice_id), &pool);
+
+            Self::distribute_yield(&env, invoice_id, &pool.token, offer.amount, pool.face_value)?;
+
+            let nft_contract: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::InvoiceNft)
+                .ok_or(KoraError::NotInitialized)?;
+            let nft_client =
+                kora_invoice_nft::InvoiceNftContractClient::new(&env, &nft_contract);
+            nft_client.set_repaid(&env.current_contract_address(), &invoice_id);
+
+            env.storage()
+                .persistent()
+                .remove(&DataKey::EarlySettlement(invoice_id));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::RepaymentLock(invoice_id));
+
+            events::repayment_made(
+                &env,
+                invoice_id,
+                &env.current_contract_address(),
+                offer.amount,
+            );
+        } else {
+            env.storage()
+                .persistent()
+                .set(&DataKey::EarlySettlement(invoice_id), &offer);
+        }
+
+        Ok(())
+    }
+
+    /// Cancel a pending early-settlement offer and refund the escrowed amount to the SME.
+    ///
+    /// Callable only by the invoice's SME while the offer has not yet been fully accepted.
+    pub fn cancel_early_settlement(
+        env: Env,
+        sme: Address,
+        invoice_id: u64,
+    ) -> Result<(), KoraError> {
+        sme.require_auth();
+
+        let offer: EarlySettlementOffer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EarlySettlement(invoice_id))
+            .ok_or(KoraError::PoolNotFound)?;
+
+        let pool: Pool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Pool(invoice_id))
+            .ok_or(KoraError::PoolNotFound)?;
+
+        let invoice = Self::load_invoice(&env, invoice_id)?;
+        if invoice.sme != sme {
+            return Err(KoraError::Unauthorized);
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::EarlySettlement(invoice_id));
+
+        let token_client = token::Client::new(&env, &pool.token);
+        token_client.transfer(&env.current_contract_address(), &sme, &offer.amount);
+
+        Ok(())
+    }
+
+    /// Read a pending early-settlement offer, if any.
+    pub fn get_early_settlement(
+        env: Env,
+        invoice_id: u64,
+    ) -> Result<EarlySettlementOffer, KoraError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EarlySettlement(invoice_id))
+            .ok_or(KoraError::PoolNotFound)
+    }
+
     // ── Views ─────────────────────────────────────────────────────────────────
 
     pub fn get_pool(env: Env, invoice_id: u64) -> Result<Pool, KoraError> {
@@ -431,6 +644,19 @@ impl FinancingPoolContract {
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    fn load_invoice(
+        env: &Env,
+        invoice_id: u64,
+    ) -> Result<kora_shared::types::Invoice, KoraError> {
+        let nft_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::InvoiceNft)
+            .ok_or(KoraError::NotInitialized)?;
+        let nft_client = kora_invoice_nft::InvoiceNftContractClient::new(env, &nft_contract);
+        Ok(nft_client.get_invoice(&invoice_id))
+    }
 
     fn require_not_paused(env: &Env) -> Result<(), KoraError> {
         let ac: Address = env

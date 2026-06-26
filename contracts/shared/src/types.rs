@@ -95,6 +95,20 @@ pub struct Pool {
     pub penalty_applied: bool,
 }
 
+/// An SME's early-termination buyout offer for a funded invoice.
+///
+/// The SME escrows `amount` (a discount to `total_owed`) into the pool; investors then
+/// accept, and once investors representing 100% of pool shares have accepted, the escrow
+/// is distributed pro-rata and the pool closes.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EarlySettlementOffer {
+    pub invoice_id: u64,
+    pub amount: i128,      // escrowed buyout amount, denominated in the pool token
+    pub accepted_bps: u32, // cumulative share_bps of investors that have accepted
+    pub accepted: Vec<Address>, // investors that have already accepted (dedup guard)
+}
+
 /// Protocol-level configuration.
 ///
 /// Note: pause state is NOT stored here — it is owned exclusively by the
