@@ -872,4 +872,67 @@ mod tests {
         let result = client.try_add_verifier(&admin, &contract_id);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_multi_sme_state_isolation_stress() {
+        // Stress test: 20 SMEs with interleaved operations
+        // Verify state never leaks between SMEs
+        let (env, admin, invoice_nft, client) = setup();
+        let verifier = Address::generate(&env);
+        client.add_verifier(&admin, &verifier).unwrap();
+
+        const NUM_SMES: usize = 20;
+        let mut smes = Vec::new();
+        let mut expected_state = Vec::new();
+
+        // Register all SMEs
+        for i in 0..NUM_SMES {
+            let sme = Address::generate(&env);
+            let score = 30u32 + (i as u32 % 50);
+            client.register_sme(&verifier, &sme, &score).unwrap();
+            smes.push(sme);
+            expected_state.push((score, 0u32, 0u32)); // (risk_score, total_invoices, defaults)
+        }
+
+        // Interleave operations in non-sequential order
+        for round in 0..5 {
+            // Update scores for odd-indexed SMEs
+            for i in (1..NUM_SMES).step_by(2) {
+                let new_score = (50u32 + round as u32) % 100;
+                client.update_sme_score(&verifier, &smes[i], &new_score).unwrap();
+                expected_state[i].0 = new_score;
+            }
+
+            // Increment invoice count for even-indexed SMEs
+            for i in (0..NUM_SMES).step_by(2) {
+                client.increment_invoice_count(&invoice_nft, &smes[i]).unwrap();
+                expected_state[i].1 += 1;
+            }
+
+            // Record defaults for scattered SMEs
+            for i in [3, 7, 11, 15, 19] {
+                if i < NUM_SMES {
+                    client.record_default(&admin, &smes[i]).unwrap();
+                    expected_state[i].2 += 1;
+                }
+            }
+        }
+
+        // Verify all SME states match expected
+        for i in 0..NUM_SMES {
+            let profile = client.get_sme_profile(&smes[i]).unwrap();
+            assert_eq!(
+                profile.risk_score, expected_state[i].0,
+                "SME {} risk_score mismatch", i
+            );
+            assert_eq!(
+                profile.total_invoices, expected_state[i].1,
+                "SME {} total_invoices mismatch", i
+            );
+            assert_eq!(
+                profile.defaults, expected_state[i].2,
+                "SME {} defaults mismatch", i
+            );
+        }
+    }
 }
