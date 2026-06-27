@@ -7,7 +7,7 @@ use kora_shared::{
     types::SmeProfile,
     validation::{require_non_empty_bytes, require_valid_risk_score, UPGRADE_TIMELOCK_DELAY},
 };
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Bytes, BytesN, Env};
 
 // ── TTL constants (in ledgers; ~5s per ledger on Stellar) ────────────────────
 /// ~30 days worth of ledgers for persistent SME/verifier data
@@ -20,7 +20,12 @@ const PERSISTENT_TTL_BUMP: u32 = 518_400;
 pub enum DataKey {
     Admin,
     InvoiceNft, // authorized caller for increment_invoice_count
+    StakingToken, // token contract for verifier stakes
+    MinimumStake, // minimum stake amount required to become verifier
+    SlashPercentage, // percentage of stake to slash on default (basis points)
     Verifier(Address),
+    VerifierStake(Address), // amount of tokens staked by verifier
+    VerifierReputation(Address), // reputation score of verifier
     SmeProfile(Address),
     DebtorScore(Bytes), // keyed by debtor_hash (SHA-256 of PII)
     UpgradeProposal,
@@ -33,18 +38,40 @@ pub struct RiskRegistryContract;
 
 #[contractimpl]
 impl RiskRegistryContract {
-    /// One-time initialization. Sets admin and the authorized invoice_nft address.
-    pub fn initialize(env: Env, admin: Address, invoice_nft: Address) -> Result<(), KoraError> {
+    /// One-time initialization. Sets admin, authorized invoice_nft, and staking parameters.
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        invoice_nft: Address,
+        staking_token: Address,
+        minimum_stake: i128,
+        slash_percentage_bps: u32,
+    ) -> Result<(), KoraError> {
         if env.storage().persistent().has(&DataKey::Admin) {
             return Err(KoraError::AlreadyInitialized);
         }
         kora_shared::validation::require_not_self(&env, &admin)?;
+        if minimum_stake <= 0 {
+            return Err(KoraError::InvalidAmount);
+        }
+        if slash_percentage_bps > 10_000 {
+            return Err(KoraError::InvalidFeeRate);
+        }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().persistent().set(&DataKey::Admin, &admin);
         Self::bump_persistent(&env, &DataKey::Admin);
         env.storage()
             .persistent()
             .set(&DataKey::InvoiceNft, &invoice_nft);
+        env.storage()
+            .persistent()
+            .set(&DataKey::StakingToken, &staking_token);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MinimumStake, &minimum_stake);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SlashPercentage, &slash_percentage_bps);
         events::registry_initialized(&env, &admin, &invoice_nft);
         Ok(())
     }
@@ -61,20 +88,48 @@ impl RiskRegistryContract {
 
     // ── Verifier management ───────────────────────────────────────────────────
 
-    /// Admin adds a trusted verifier.
-    pub fn add_verifier(env: Env, admin: Address, verifier: Address) -> Result<(), KoraError> {
+    /// Admin adds a trusted verifier with required staking deposit.
+    pub fn add_verifier(env: Env, admin: Address, verifier: Address, stake_amount: i128) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         kora_shared::validation::require_not_self(&env, &verifier)?;
+
+        let minimum_stake: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MinimumStake)
+            .ok_or(KoraError::NotInitialized)?;
+
+        if stake_amount < minimum_stake {
+            return Err(KoraError::InsufficientFunds);
+        }
+
+        let token_addr: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakingToken)
+            .ok_or(KoraError::NotInitialized)?;
+
+        let token_client = soroban_sdk::token::Client::new(&env, &token_addr);
+        token_client.transfer(&verifier, &env.current_contract_address(), &stake_amount);
+
         env.storage()
             .persistent()
             .set(&DataKey::Verifier(verifier.clone()), &true);
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerifierStake(verifier.clone()), &stake_amount);
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerifierReputation(verifier.clone()), &100u32);
         Self::bump_persistent(&env, &DataKey::Verifier(verifier.clone()));
+        Self::bump_persistent(&env, &DataKey::VerifierStake(verifier.clone()));
+        Self::bump_persistent(&env, &DataKey::VerifierReputation(verifier.clone()));
         events::verifier_added(&env, &admin, &verifier);
         Ok(())
     }
 
-    /// Admin removes a verifier. Uses remove() to reclaim storage.
+    /// Admin removes a verifier and returns their stake.
     pub fn remove_verifier(env: Env, admin: Address, verifier: Address) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
@@ -87,9 +142,32 @@ impl RiskRegistryContract {
         {
             return Err(KoraError::NotVerifier);
         }
+
+        let stake: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VerifierStake(verifier.clone()))
+            .unwrap_or(0);
+
+        if stake > 0 {
+            let token_addr: Address = env
+                .storage()
+                .persistent()
+                .get(&DataKey::StakingToken)
+                .ok_or(KoraError::NotInitialized)?;
+            let token_client = soroban_sdk::token::Client::new(&env, &token_addr);
+            token_client.transfer(&env.current_contract_address(), &verifier, &stake);
+        }
+
         env.storage()
             .persistent()
             .remove(&DataKey::Verifier(verifier.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::VerifierStake(verifier.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::VerifierReputation(verifier.clone()));
         events::verifier_removed(&env, &admin, &verifier);
         Ok(())
     }
@@ -193,7 +271,7 @@ impl RiskRegistryContract {
         Ok(())
     }
 
-    /// Record a default against an SME. Admin only.
+    /// Record a default against an SME. Admin only. Slashes verifier's stake and reputation.
     pub fn record_default(env: Env, admin: Address, sme: Address) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
@@ -209,6 +287,42 @@ impl RiskRegistryContract {
             .defaults
             .checked_add(1)
             .ok_or(KoraError::ArithmeticOverflow)?;
+
+        let verifier = profile.verifier.clone();
+        let slash_percentage: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SlashPercentage)
+            .ok_or(KoraError::NotInitialized)?;
+
+        let current_stake: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VerifierStake(verifier.clone()))
+            .unwrap_or(0);
+
+        if current_stake > 0 {
+            let slash_amount = (current_stake as u128 * slash_percentage as u128 / 10_000) as i128;
+            let remaining_stake = current_stake.checked_sub(slash_amount)
+                .ok_or(KoraError::ArithmeticUnderflow)?;
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::VerifierStake(verifier.clone()), &remaining_stake);
+            Self::bump_persistent(&env, &DataKey::VerifierStake(verifier.clone()));
+        }
+
+        let current_reputation: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VerifierReputation(verifier.clone()))
+            .unwrap_or(100);
+
+        let new_reputation = current_reputation.saturating_sub(10);
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerifierReputation(verifier.clone()), &new_reputation);
+        Self::bump_persistent(&env, &DataKey::VerifierReputation(verifier.clone()));
 
         env.storage()
             .persistent()
@@ -265,6 +379,20 @@ impl RiskRegistryContract {
             .get::<DataKey, SmeProfile>(&DataKey::SmeProfile(sme))
             .map(|p| p.compliance_attested)
             .unwrap_or(false)
+    }
+
+    pub fn get_verifier_stake(env: Env, verifier: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::VerifierStake(verifier))
+            .unwrap_or(0)
+    }
+
+    pub fn get_verifier_reputation(env: Env, verifier: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::VerifierReputation(verifier))
+            .unwrap_or(0)
     }
 
     pub fn is_verifier(env: Env, verifier: Address) -> bool {
@@ -379,16 +507,17 @@ mod tests {
     use super::*;
     use soroban_sdk::{testutils::Address as _, Bytes, Env};
 
-    /// Returns (env, admin, invoice_nft, client)
-    fn setup() -> (Env, Address, Address, RiskRegistryContractClient<'static>) {
+    /// Returns (env, admin, invoice_nft, staking_token, client)
+    fn setup() -> (Env, Address, Address, Address, RiskRegistryContractClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, RiskRegistryContract);
         let client = RiskRegistryContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let invoice_nft = Address::generate(&env);
-        client.initialize(&admin, &invoice_nft).unwrap();
-        (env, admin, invoice_nft, client)
+        let staking_token = Address::generate(&env);
+        client.initialize(&admin, &invoice_nft, &staking_token, &1_000_000i128, &5_000u32).unwrap();
+        (env, admin, invoice_nft, staking_token, client)
     }
 
     // ── initialize ────────────────────────────────────────────────────────────
@@ -401,20 +530,21 @@ mod tests {
         let client = RiskRegistryContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let invoice_nft = Address::generate(&env);
-        assert!(client.try_initialize(&admin, &invoice_nft).is_ok());
+        let staking_token = Address::generate(&env);
+        assert!(client.try_initialize(&admin, &invoice_nft, &staking_token, &1_000_000i128, &5_000u32).is_ok());
     }
 
     #[test]
     fn test_initialize_already_initialized() {
-        let (env, admin, invoice_nft, client) = setup();
-        assert!(client.try_initialize(&admin, &invoice_nft).is_err());
+        let (env, admin, invoice_nft, staking_token, client) = setup();
+        assert!(client.try_initialize(&admin, &invoice_nft, &staking_token, &1_000_000i128, &5_000u32).is_err());
     }
 
     // ── transfer_admin ────────────────────────────────────────────────────────
 
     #[test]
     fn test_transfer_admin_success() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let new_admin = Address::generate(&env);
         client.transfer_admin(&admin, &new_admin).unwrap();
         assert_eq!(client.get_admin().unwrap(), new_admin);
@@ -432,7 +562,7 @@ mod tests {
 
     #[test]
     fn test_add_verifier_success() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         assert!(client.try_add_verifier(&admin, &verifier).is_ok());
         assert!(client.is_verifier(&verifier));
@@ -448,9 +578,9 @@ mod tests {
 
     #[test]
     fn test_remove_verifier_success() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         assert!(client.is_verifier(&verifier));
         assert!(client.try_remove_verifier(&admin, &verifier).is_ok());
         assert!(!client.is_verifier(&verifier));
@@ -458,29 +588,29 @@ mod tests {
 
     #[test]
     fn test_remove_verifier_not_admin() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let stranger = Address::generate(&env);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         assert!(client.try_remove_verifier(&stranger, &verifier).is_err());
     }
 
     #[test]
     fn test_remove_verifier_not_registered() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         assert!(client.try_remove_verifier(&admin, &verifier).is_err());
     }
 
     #[test]
     fn test_multiple_verifiers() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let v1 = Address::generate(&env);
         let v2 = Address::generate(&env);
         let sme1 = Address::generate(&env);
         let sme2 = Address::generate(&env);
-        client.add_verifier(&admin, &v1).unwrap();
-        client.add_verifier(&admin, &v2).unwrap();
+        client.add_verifier(&admin, &v1, &1_000_000i128).unwrap();
+        client.add_verifier(&admin, &v2, &1_000_000i128).unwrap();
         client.register_sme(&v1, &sme1, &30u32, &true).unwrap();
         client.register_sme(&v2, &sme2, &60u32, &true).unwrap();
         assert_eq!(client.get_sme_profile(&sme1).unwrap().risk_score, 30);
@@ -493,10 +623,10 @@ mod tests {
 
     #[test]
     fn test_register_sme_flow() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         client.register_sme(&verifier, &sme, &35u32, &true).unwrap();
         assert!(client.is_verified_sme(&sme));
         let profile = client.get_sme_profile(&sme).unwrap();
@@ -510,10 +640,10 @@ mod tests {
 
     #[test]
     fn test_register_sme_duplicate_rejected() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         client.register_sme(&verifier, &sme, &35u32, &true).unwrap();
         assert!(client.try_register_sme(&verifier, &sme, &50u32).is_err());
     }
@@ -528,19 +658,19 @@ mod tests {
 
     #[test]
     fn test_register_sme_invalid_risk_score() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         assert!(client.try_register_sme(&verifier, &sme, &101u32).is_err());
     }
 
     #[test]
     fn test_register_sme_preserves_history_on_re_registration_attempt() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         client.register_sme(&verifier, &sme, &35u32, &true).unwrap();
         let _ = client.try_register_sme(&verifier, &sme, &99u32, &true);
         let profile = client.get_sme_profile(&sme).unwrap();
@@ -549,10 +679,10 @@ mod tests {
 
     #[test]
     fn test_register_sme_compliance_attested_true() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         client.register_sme(&verifier, &sme, &50u32, &true).unwrap();
         let profile = client.get_sme_profile(&sme).unwrap();
         assert!(profile.compliance_attested);
@@ -561,10 +691,10 @@ mod tests {
 
     #[test]
     fn test_register_sme_compliance_attested_false() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         client.register_sme(&verifier, &sme, &50u32, &false).unwrap();
         let profile = client.get_sme_profile(&sme).unwrap();
         assert!(!profile.compliance_attested);
@@ -575,10 +705,10 @@ mod tests {
 
     #[test]
     fn test_update_sme_score_success() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         client.register_sme(&verifier, &sme, &35u32, &true).unwrap();
         client.update_sme_score(&verifier, &sme, &50u32).unwrap();
         assert_eq!(client.get_sme_profile(&sme).unwrap().risk_score, 50);
@@ -586,10 +716,10 @@ mod tests {
 
     #[test]
     fn test_update_sme_score_not_registered() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         assert!(client
             .try_update_sme_score(&verifier, &sme, &50u32)
             .is_err());
@@ -597,10 +727,10 @@ mod tests {
 
     #[test]
     fn test_update_sme_score_invalid() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         client.register_sme(&verifier, &sme, &35u32, &true).unwrap();
         assert!(client
             .try_update_sme_score(&verifier, &sme, &101u32)
@@ -609,10 +739,10 @@ mod tests {
 
     #[test]
     fn test_update_sme_score_boundary_values() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         client.register_sme(&verifier, &sme, &50u32, &true).unwrap();
         client.update_sme_score(&verifier, &sme, &0u32).unwrap();
         assert_eq!(client.get_sme_profile(&sme).unwrap().risk_score, 0);
@@ -624,10 +754,10 @@ mod tests {
 
     #[test]
     fn test_increment_invoice_count() {
-        let (env, admin, invoice_nft, client) = setup();
+        let (env, admin, invoice_nft, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         client.register_sme(&verifier, &sme, &35u32, &true).unwrap();
         assert_eq!(client.get_sme_profile(&sme).unwrap().total_invoices, 0);
         client.increment_invoice_count(&invoice_nft, &sme).unwrap();
@@ -636,10 +766,10 @@ mod tests {
 
     #[test]
     fn test_increment_invoice_count_multiple() {
-        let (env, admin, invoice_nft, client) = setup();
+        let (env, admin, invoice_nft, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         client.register_sme(&verifier, &sme, &35u32, &true).unwrap();
         for i in 1u32..=5 {
             client.increment_invoice_count(&invoice_nft, &sme).unwrap();
@@ -649,11 +779,11 @@ mod tests {
 
     #[test]
     fn test_increment_invoice_count_unauthorized_caller() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         let stranger = Address::generate(&env);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         client.register_sme(&verifier, &sme, &35u32, &true).unwrap();
         assert!(client.try_increment_invoice_count(&stranger, &sme).is_err());
     }
@@ -671,10 +801,10 @@ mod tests {
 
     #[test]
     fn test_record_default() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         client.register_sme(&verifier, &sme, &35u32, &true).unwrap();
         assert_eq!(client.get_sme_profile(&sme).unwrap().defaults, 0);
         client.record_default(&admin, &sme).unwrap();
@@ -683,28 +813,28 @@ mod tests {
 
     #[test]
     fn test_record_default_not_admin() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
         let stranger = Address::generate(&env);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         client.register_sme(&verifier, &sme, &35u32, &true).unwrap();
         assert!(client.try_record_default(&stranger, &sme).is_err());
     }
 
     #[test]
     fn test_record_default_sme_not_registered() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let sme = Address::generate(&env);
         assert!(client.try_record_default(&admin, &sme).is_err());
     }
 
     #[test]
     fn test_record_multiple_defaults() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         client.register_sme(&verifier, &sme, &35u32, &true).unwrap();
         client.record_default(&admin, &sme).unwrap();
         client.record_default(&admin, &sme).unwrap();
@@ -716,10 +846,10 @@ mod tests {
 
     #[test]
     fn test_set_debtor_score() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[0xABu8; 32]);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         client
             .set_debtor_score(&verifier, &debtor_hash, &45u32)
             .unwrap();
@@ -728,10 +858,10 @@ mod tests {
 
     #[test]
     fn test_set_debtor_score_invalid_score() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[0xABu8; 32]);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         assert!(client
             .try_set_debtor_score(&verifier, &debtor_hash, &101u32)
             .is_err());
@@ -739,10 +869,10 @@ mod tests {
 
     #[test]
     fn test_set_debtor_score_empty_hash() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let empty_hash = Bytes::from_slice(&env, &[]);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         assert!(client
             .try_set_debtor_score(&verifier, &empty_hash, &50u32)
             .is_err());
@@ -767,9 +897,9 @@ mod tests {
 
     #[test]
     fn test_debtor_score_boundary_values() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         let hash0 = Bytes::from_slice(&env, &[0x01u8; 32]);
         client.set_debtor_score(&verifier, &hash0, &0u32).unwrap();
         assert_eq!(client.get_debtor_score(&hash0).unwrap(), 0u32);
@@ -804,9 +934,9 @@ mod tests {
 
     #[test]
     fn test_risk_score_boundary_values() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         let sme0 = Address::generate(&env);
         client.register_sme(&verifier, &sme0, &0u32, &true).unwrap();
         assert_eq!(client.get_sme_profile(&sme0).unwrap().risk_score, 0);
@@ -823,17 +953,17 @@ mod tests {
 
     #[test]
     fn test_add_verifier_emits_event() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         assert!(!env.events().all().is_empty());
     }
 
     #[test]
     fn test_remove_verifier_emits_event() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         let events_before = env.events().all().len();
         client.remove_verifier(&admin, &verifier).unwrap();
         assert!(env.events().all().len() > events_before);
@@ -841,10 +971,10 @@ mod tests {
 
     #[test]
     fn test_register_sme_emits_event() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         let events_before = env.events().all().len();
         client.register_sme(&verifier, &sme, &42u32, &true).unwrap();
         assert!(env.events().all().len() > events_before);
@@ -852,10 +982,10 @@ mod tests {
 
     #[test]
     fn test_increment_invoice_count_emits_event() {
-        let (env, admin, invoice_nft, client) = setup();
+        let (env, admin, invoice_nft, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         client.register_sme(&verifier, &sme, &35u32, &true).unwrap();
         let events_before = env.events().all().len();
         client.increment_invoice_count(&invoice_nft, &sme).unwrap();
@@ -877,10 +1007,10 @@ mod tests {
 
     #[test]
     fn test_sme_default_event_carries_cumulative_count() {
-        let (env, admin, _, client) = setup();
+        let (env, admin, _, staking_token, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         client.register_sme(&verifier, &sme, &80u32, &true).unwrap();
         client.record_default(&admin, &sme).unwrap();
         assert_eq!(client.get_sme_profile(&sme).unwrap().defaults, 1);
@@ -896,15 +1026,99 @@ mod tests {
         env.mock_all_auths();
         let contract_id = env.register_contract(None, RiskRegistryContract);
         let client = RiskRegistryContractClient::new(&env, &contract_id);
-        let result = client.try_initialize(&contract_id);
+        let staking_token = Address::generate(&env);
+        let result = client.try_initialize(&contract_id, &contract_id, &staking_token, &1_000_000i128, &5_000u32);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_add_verifier_self_as_verifier_rejected() {
-        let (env, admin, client) = setup();
+        let (env, admin, _, _, client) = setup();
         let contract_id = client.address.clone();
-        let result = client.try_add_verifier(&admin, &contract_id);
+        let result = client.try_add_verifier(&admin, &contract_id, &1_000_000i128);
         assert!(result.is_err());
+    }
+
+    // ── Staking and Reputation ────────────────────────────────────────────────
+
+    #[test]
+    fn test_add_verifier_insufficient_stake_rejected() {
+        let (env, admin, _, _, client) = setup();
+        let verifier = Address::generate(&env);
+        let result = client.try_add_verifier(&admin, &verifier, &500_000i128);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InsufficientFunds);
+    }
+
+    #[test]
+    fn test_add_verifier_stores_stake() {
+        let (env, admin, _, _, client) = setup();
+        let verifier = Address::generate(&env);
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
+        assert_eq!(client.get_verifier_stake(&verifier), 1_000_000i128);
+    }
+
+    #[test]
+    fn test_add_verifier_initializes_reputation() {
+        let (env, admin, _, _, client) = setup();
+        let verifier = Address::generate(&env);
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
+        assert_eq!(client.get_verifier_reputation(&verifier), 100u32);
+    }
+
+    #[test]
+    fn test_record_default_slashes_stake() {
+        let (env, admin, _, _, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
+        client.register_sme(&verifier, &sme, &50u32, &true).unwrap();
+        assert_eq!(client.get_verifier_stake(&verifier), 1_000_000i128);
+
+        client.record_default(&admin, &sme).unwrap();
+        let remaining_stake = client.get_verifier_stake(&verifier);
+        assert!(remaining_stake < 1_000_000i128);
+        let slashed = 1_000_000i128 - remaining_stake;
+        let expected_slash = (1_000_000i128 as u128 * 5_000u128 / 10_000) as i128;
+        assert_eq!(slashed, expected_slash);
+    }
+
+    #[test]
+    fn test_record_default_decreases_reputation() {
+        let (env, admin, _, _, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
+        client.register_sme(&verifier, &sme, &50u32, &true).unwrap();
+        assert_eq!(client.get_verifier_reputation(&verifier), 100u32);
+
+        client.record_default(&admin, &sme).unwrap();
+        assert_eq!(client.get_verifier_reputation(&verifier), 90u32);
+    }
+
+    #[test]
+    fn test_remove_verifier_returns_stake() {
+        let (env, admin, _, _, client) = setup();
+        let verifier = Address::generate(&env);
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
+        assert_eq!(client.get_verifier_stake(&verifier), 1_000_000i128);
+
+        client.remove_verifier(&admin, &verifier).unwrap();
+        assert_eq!(client.get_verifier_stake(&verifier), 0i128);
+    }
+
+    #[test]
+    fn test_reputation_decreases_on_multiple_defaults() {
+        let (env, admin, _, _, client) = setup();
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+        client.add_verifier(&admin, &verifier, &10_000_000i128).unwrap();
+        client.register_sme(&verifier, &sme, &50u32, &true).unwrap();
+
+        client.record_default(&admin, &sme).unwrap();
+        assert_eq!(client.get_verifier_reputation(&verifier), 90u32);
+        client.record_default(&admin, &sme).unwrap();
+        assert_eq!(client.get_verifier_reputation(&verifier), 80u32);
+        client.record_default(&admin, &sme).unwrap();
+        assert_eq!(client.get_verifier_reputation(&verifier), 70u32);
     }
 }

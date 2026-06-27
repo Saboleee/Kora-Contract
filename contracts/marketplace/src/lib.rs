@@ -618,7 +618,8 @@ mod tests {
         let registry_id = env.register_contract(None, kora_risk_registry::RiskRegistryContract);
         let registry = registry_id.clone();
         let registry_client = kora_risk_registry::RiskRegistryContractClient::new(&env, &registry_id);
-        registry_client.initialize(&admin, &nft_id);
+        let staking_token = Address::generate(&env);
+        registry_client.initialize(&admin, &nft_id, &staking_token, &1_000_000i128, &5_000u32);
 
         let mp_ac = Address::generate(&env);
         let mp_id = env.register_contract(None, MarketplaceContract);
