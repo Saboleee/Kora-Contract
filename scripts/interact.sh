@@ -19,12 +19,12 @@ if [ ! -f "$MANIFEST" ]; then
 fi
 
 # Load contract addresses from manifest
-ACCESS_CONTROL=$(jq -r '.contracts.access_control' "$MANIFEST")
-INVOICE_NFT=$(jq -r '.contracts.invoice_nft' "$MANIFEST")
-MARKETPLACE=$(jq -r '.contracts.marketplace' "$MANIFEST")
-POOL=$(jq -r '.contracts.financing_pool' "$MANIFEST")
-TREASURY=$(jq -r '.contracts.treasury' "$MANIFEST")
-RISK_REGISTRY=$(jq -r '.contracts.risk_registry' "$MANIFEST")
+ACCESS_CONTROL=$(jq -r '.contracts.access_control.address' "$MANIFEST")
+INVOICE_NFT=$(jq -r '.contracts.invoice_nft.address' "$MANIFEST")
+MARKETPLACE=$(jq -r '.contracts.marketplace.address' "$MANIFEST")
+POOL=$(jq -r '.contracts.financing_pool.address' "$MANIFEST")
+TREASURY=$(jq -r '.contracts.treasury.address' "$MANIFEST")
+RISK_REGISTRY=$(jq -r '.contracts.risk_registry.address' "$MANIFEST")
 
 case "$NETWORK" in
   testnet)
