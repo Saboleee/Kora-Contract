@@ -2,7 +2,7 @@
 # Kora Protocol — Makefile
 # =============================================================================
 
-.PHONY: build test clean fmt lint check deploy-testnet deploy-mainnet
+.PHONY: build test clean fmt lint check audit deploy-testnet deploy-mainnet
 
 WASM_TARGET := wasm32-unknown-unknown
 CONTRACTS   := access_control invoice_nft marketplace financing_pool treasury risk_registry
@@ -39,6 +39,12 @@ lint:
 
 check:
 	cargo check --all
+
+# ── Audit ─────────────────────────────────────────────────────────────────────
+
+audit:
+	cargo audit
+	cargo deny check
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 
