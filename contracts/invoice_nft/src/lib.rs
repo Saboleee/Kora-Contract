@@ -18,7 +18,7 @@ use kora_shared::{
     reentrancy::ReentrancyGuard,
     types::{Invoice, InvoiceStatus, RiskTier},
     validation::{
-        require_future_timestamp, require_non_empty_bytes, require_non_empty_string,
+        require_exact_length, require_future_timestamp, require_non_empty_string,
         require_non_zero_amount, require_valid_risk_score, UPGRADE_TIMELOCK_DELAY,
     },
 };
@@ -138,7 +138,7 @@ impl InvoiceNftContract {
         require_non_zero_amount(amount)?;
         require_future_timestamp(&env, due_date)?;
         require_valid_risk_score(risk_score)?;
-        require_non_empty_bytes(&debtor_hash)?;
+        require_exact_length(&debtor_hash, 32)?;
         require_non_empty_string(&ipfs_cid)?;
 
         let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
@@ -620,7 +620,58 @@ mod tests {
             &sme, &debtor_hash, &1_000_000_000i128,
             &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::EmptyString);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_mint_invoice_debtor_hash_exact_32_bytes_accepted() {
+        let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[0xABu8; 32]);
+        let ipfs_cid = String::from_str(
+            &env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
+        let due_date = env.ledger().timestamp() + 86_400;
+        let result = client.try_mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_mint_invoice_debtor_hash_31_bytes_rejected() {
+        let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[0xABu8; 31]);
+        let ipfs_cid = String::from_str(
+            &env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
+        let due_date = env.ledger().timestamp() + 86_400;
+        let result = client.try_mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+        );
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidLength);
+    }
+
+    #[test]
+    fn test_mint_invoice_debtor_hash_33_bytes_rejected() {
+        let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[0xABu8; 33]);
+        let ipfs_cid = String::from_str(
+            &env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
+        let due_date = env.ledger().timestamp() + 86_400;
+        let result = client.try_mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+        );
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidLength);
     }
 
     #[test]

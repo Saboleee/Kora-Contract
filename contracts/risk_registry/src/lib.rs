@@ -5,7 +5,7 @@ use kora_shared::{
     events,
     reentrancy::ReentrancyGuard,
     types::SmeProfile,
-    validation::{require_non_empty_bytes, require_valid_risk_score, UPGRADE_TIMELOCK_DELAY},
+    validation::{require_exact_length, require_valid_risk_score, UPGRADE_TIMELOCK_DELAY},
 };
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env};
 
@@ -225,8 +225,8 @@ impl RiskRegistryContract {
     ) -> Result<(), KoraError> {
         verifier.require_auth();
         Self::require_verifier(&env, &verifier)?;
-        // Validate bytes before score — returns EmptyBytes for empty hash
-        require_non_empty_bytes(&debtor_hash)?;
+        // Validate exact 32-byte SHA-256 length before score
+        require_exact_length(&debtor_hash, 32)?;
         require_valid_risk_score(score)?;
         env.storage()
             .persistent()
@@ -711,6 +711,35 @@ mod tests {
         assert!(client
             .try_set_debtor_score(&verifier, &empty_hash, &50u32)
             .is_err());
+    }
+
+    #[test]
+    fn test_set_debtor_score_exact_32_bytes_accepted() {
+        let (env, admin, _, client) = setup();
+        let verifier = Address::generate(&env);
+        let hash = Bytes::from_slice(&env, &[0xABu8; 32]);
+        client.add_verifier(&admin, &verifier).unwrap();
+        assert!(client.try_set_debtor_score(&verifier, &hash, &50u32).is_ok());
+    }
+
+    #[test]
+    fn test_set_debtor_score_31_bytes_rejected() {
+        let (env, admin, _, client) = setup();
+        let verifier = Address::generate(&env);
+        let hash = Bytes::from_slice(&env, &[0xABu8; 31]);
+        client.add_verifier(&admin, &verifier).unwrap();
+        let result = client.try_set_debtor_score(&verifier, &hash, &50u32);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidLength);
+    }
+
+    #[test]
+    fn test_set_debtor_score_33_bytes_rejected() {
+        let (env, admin, _, client) = setup();
+        let verifier = Address::generate(&env);
+        let hash = Bytes::from_slice(&env, &[0xABu8; 33]);
+        client.add_verifier(&admin, &verifier).unwrap();
+        let result = client.try_set_debtor_score(&verifier, &hash, &50u32);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidLength);
     }
 
     #[test]

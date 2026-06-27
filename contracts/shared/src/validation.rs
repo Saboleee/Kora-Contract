@@ -87,6 +87,16 @@ pub fn require_non_empty_bytes(b: &Bytes) -> Result<(), KoraError> {
     Ok(())
 }
 
+/// Reject byte slices whose length differs from `len`.
+/// Used to enforce exact-width fields such as SHA-256 debtor hashes (32 bytes).
+#[inline]
+pub fn require_exact_length(b: &Bytes, len: u32) -> Result<(), KoraError> {
+    if b.len() != len {
+        return Err(KoraError::InvalidLength);
+    }
+    Ok(())
+}
+
 // ── Safe arithmetic ───────────────────────────────────────────────────────────
 
 /// Compute `amount * bps / 10_000` with overflow protection.
