@@ -396,3 +396,21 @@ pub fn refund_claimed(env: &Env, invoice_id: u64, investor: &Address, amount: i1
         ),
     );
 }
+
+// ── Secondary Market Events ───────────────────────────────────────────────────
+
+pub fn position_listed_for_sale(env: &Env, invoice_id: u64, seller: &Address, price: i128) {
+    emit(
+        env,
+        symbol_short!("POS_SALE"),
+        (invoice_id, seller.clone(), price, env.ledger().timestamp()),
+    );
+}
+
+pub fn position_sold(env: &Env, invoice_id: u64, seller: &Address, buyer: &Address, price: i128) {
+    emit(
+        env,
+        symbol_short!("POS_SOLD"),
+        (invoice_id, seller.clone(), buyer.clone(), price, env.ledger().timestamp()),
+    );
+}

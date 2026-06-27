@@ -36,6 +36,9 @@ pub enum KoraError {
     PoolAlreadyClosed = 31,
     RepaymentAlreadyMade = 32,
     InsufficientPoolBalance = 33,
+    PositionNotFound = 34,
+    SaleAlreadyListed = 35,
+    SaleNotFound = 36,
 
     // Treasury
     InvalidFeeRate = 40,

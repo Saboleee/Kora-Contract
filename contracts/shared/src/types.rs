@@ -95,6 +95,16 @@ pub struct Pool {
     pub penalty_applied: bool,
 }
 
+/// An active offer to sell an investor position on the secondary market
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PositionSaleOffer {
+    pub seller: Address,
+    pub invoice_id: u64,
+    pub token: Address,
+    pub price: i128,
+}
+
 /// Protocol-level configuration.
 ///
 /// Note: pause state is NOT stored here — it is owned exclusively by the

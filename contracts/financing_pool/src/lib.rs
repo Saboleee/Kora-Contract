@@ -3,7 +3,7 @@
 use kora_shared::{
     errors::KoraError,
     events,
-    types::{Pool, Position},
+    types::{Pool, Position, PositionSaleOffer},
     validation::{bps_of_normalized, UPGRADE_TIMELOCK_DELAY},
 };
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Map, Vec};
@@ -28,6 +28,7 @@ pub enum DataKey {
     AccessControl,
     RepaymentLock(u64),
     UpgradeProposal,
+    SaleOffer(u64, Address),
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -395,6 +396,126 @@ impl FinancingPoolContract {
             .get(&DataKey::Positions(invoice_id))
             .unwrap_or(Map::new(&env));
         positions.values()
+    }
+
+    // ── Secondary market ───────────────────────────────────────────────────────
+
+    /// List a position for sale on the secondary market.
+    /// Seller must hold a position on an open (not yet closed) pool.
+    pub fn list_position_for_sale(
+        env: Env,
+        seller: Address,
+        invoice_id: u64,
+        token: Address,
+        price: i128,
+    ) -> Result<(), KoraError> {
+        seller.require_auth();
+        Self::require_not_paused(&env)?;
+
+        if price <= 0 {
+            return Err(KoraError::InvalidAmount);
+        }
+
+        let pool: Pool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Pool(invoice_id))
+            .ok_or(KoraError::PoolNotFound)?;
+        if pool.is_closed {
+            return Err(KoraError::PoolAlreadyClosed);
+        }
+
+        let positions: Map<Address, Position> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Positions(invoice_id))
+            .unwrap_or_else(|| Map::new(&env));
+        if !positions.contains_key(seller.clone()) {
+            return Err(KoraError::PositionNotFound);
+        }
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::SaleOffer(invoice_id, seller.clone()))
+        {
+            return Err(KoraError::SaleAlreadyListed);
+        }
+
+        let offer = PositionSaleOffer {
+            seller: seller.clone(),
+            invoice_id,
+            token,
+            price,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::SaleOffer(invoice_id, seller.clone()), &offer);
+
+        events::position_listed_for_sale(&env, invoice_id, &seller, price);
+        Ok(())
+    }
+
+    /// Purchase an investor position from the secondary market.
+    /// Transfers ownership of the position (and its proportional yield claim)
+    /// from seller to buyer in exchange for a token payment.
+    pub fn buy_position(
+        env: Env,
+        buyer: Address,
+        invoice_id: u64,
+        seller: Address,
+    ) -> Result<(), KoraError> {
+        buyer.require_auth();
+        Self::require_not_paused(&env)?;
+
+        let offer: PositionSaleOffer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SaleOffer(invoice_id, seller.clone()))
+            .ok_or(KoraError::SaleNotFound)?;
+
+        let pool: Pool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Pool(invoice_id))
+            .ok_or(KoraError::PoolNotFound)?;
+        if pool.is_closed {
+            return Err(KoraError::PoolAlreadyClosed);
+        }
+
+        let mut positions: Map<Address, Position> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Positions(invoice_id))
+            .unwrap_or_else(|| Map::new(&env));
+
+        let seller_position: Position = positions
+            .get(seller.clone())
+            .ok_or(KoraError::PositionNotFound)?;
+
+        // CEI: update state before external token transfer
+        env.storage()
+            .persistent()
+            .remove(&DataKey::SaleOffer(invoice_id, seller.clone()));
+
+        positions.remove(seller.clone());
+        let buyer_position = Position {
+            investor: buyer.clone(),
+            invoice_id,
+            contributed: seller_position.contributed,
+            share_bps: seller_position.share_bps,
+            yield_claimed: seller_position.yield_claimed,
+        };
+        positions.set(buyer.clone(), buyer_position);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Positions(invoice_id), &positions);
+
+        let token_client = token::Client::new(&env, &offer.token);
+        token_client.transfer(&buyer, &seller, &offer.price);
+
+        events::position_sold(&env, invoice_id, &seller, &buyer, offer.price);
+        Ok(())
     }
 
     // ── Upgrade ────────────────────────────────────────────────────────────────
@@ -878,6 +999,133 @@ mod tests {
         let oracle = Address::generate(&env);
         let result = client.try_initialize(&admin, &nft, &treasury, &ac, &10_000u32, &oracle);
         assert!(result.is_ok());
+    }
+
+    // ── Secondary market tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_list_position_for_sale_pool_not_found() {
+        let (env, _admin, _nft, _treasury, _ac, client) = setup();
+        let seller = Address::generate(&env);
+        let token = Address::generate(&env);
+        let result = client.try_list_position_for_sale(&seller, &1u64, &token, &1_000i128);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::PoolNotFound);
+    }
+
+    #[test]
+    fn test_list_position_for_sale_zero_price_rejected() {
+        let (env, _admin, _nft, _treasury, _ac, client) = setup();
+        let seller = Address::generate(&env);
+        let token = Address::generate(&env);
+        let result = client.try_list_position_for_sale(&seller, &1u64, &token, &0i128);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
+    }
+
+    #[test]
+    fn test_list_position_for_sale_position_not_found() {
+        let (env, _admin, _nft, _treasury, _ac, client) = setup();
+        let contract_id = client.address.clone();
+        let token = Address::generate(&env);
+        let seller = Address::generate(&env);
+
+        // Seed an open pool directly into contract storage
+        let pool = Pool {
+            invoice_id: 1,
+            token: token.clone(),
+            total_funded: 10_000_000_000,
+            face_value: 10_000_000_000,
+            repaid_amount: 0,
+            is_closed: false,
+            late_penalty_bps: 200,
+            total_owed: 10_000_000_000,
+            penalty_applied: false,
+        };
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(&DataKey::Pool(1u64), &pool);
+        });
+
+        let result = client.try_list_position_for_sale(&seller, &1u64, &token, &5_000_000_000i128);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::PositionNotFound);
+    }
+
+    #[test]
+    fn test_list_position_for_sale_double_listing_prevented() {
+        let (env, admin, _nft, _treasury, _ac, client) = setup();
+        let contract_id = client.address.clone();
+        let token = Address::generate(&env);
+        let seller = Address::generate(&env);
+
+        let pool = Pool {
+            invoice_id: 1,
+            token: token.clone(),
+            total_funded: 10_000_000_000,
+            face_value: 10_000_000_000,
+            repaid_amount: 0,
+            is_closed: false,
+            late_penalty_bps: 200,
+            total_owed: 10_000_000_000,
+            penalty_applied: false,
+        };
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(&DataKey::Pool(1u64), &pool);
+        });
+
+        // Record position so seller can list
+        client.record_position(&admin, &1u64, &seller, &5_000_000_000i128, &10_000_000_000i128);
+
+        // First listing succeeds
+        assert!(client
+            .try_list_position_for_sale(&seller, &1u64, &token, &4_500_000_000i128)
+            .is_ok());
+
+        // Second listing is rejected
+        let result =
+            client.try_list_position_for_sale(&seller, &1u64, &token, &4_000_000_000i128);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::SaleAlreadyListed);
+    }
+
+    #[test]
+    fn test_buy_position_sale_not_found() {
+        let (env, _admin, _nft, _treasury, _ac, client) = setup();
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let result = client.try_buy_position(&buyer, &1u64, &seller);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::SaleNotFound);
+    }
+
+    #[test]
+    fn test_buy_position_transfers_ownership() {
+        let (env, admin, _nft, _treasury, _ac, client) = setup();
+        let contract_id = client.address.clone();
+        let token = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+
+        let pool = Pool {
+            invoice_id: 1,
+            token: token.clone(),
+            total_funded: 10_000_000_000,
+            face_value: 10_000_000_000,
+            repaid_amount: 0,
+            is_closed: false,
+            late_penalty_bps: 200,
+            total_owed: 10_000_000_000,
+            penalty_applied: false,
+        };
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(&DataKey::Pool(1u64), &pool);
+        });
+
+        client.record_position(&admin, &1u64, &seller, &5_000_000_000i128, &10_000_000_000i128);
+        client.list_position_for_sale(&seller, &1u64, &token, &4_500_000_000i128);
+
+        // After buy, position ownership moves to buyer
+        client.buy_position(&buyer, &1u64, &seller);
+
+        let positions = client.get_positions(&1u64);
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions.get(0).unwrap().investor, buyer);
+        assert_eq!(positions.get(0).unwrap().share_bps, 5_000u32);
     }
 }
 
