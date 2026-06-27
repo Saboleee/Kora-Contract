@@ -7,6 +7,20 @@ pub const UPGRADE_TIMELOCK_DELAY: u64 = 86_400;
 
 // ── Amount guards ─────────────────────────────────────────────────────────────
 
+/// Upper bound for i128 amounts — prevents overflow in intermediate arithmetic
+/// (e.g., multiplication by fee/bps values). Any amount above this ceiling risks
+/// overflow when multiplied by 10_000 (max bps).
+pub const MAX_AMOUNT: i128 = i128::MAX / 2;
+
+/// Reject amounts that exceed the overflow-safety ceiling.
+#[inline]
+pub fn require_within_max_amount(amount: i128) -> Result<(), KoraError> {
+    if amount > MAX_AMOUNT {
+        return Err(KoraError::InvalidAmount);
+    }
+    Ok(())
+}
+
 /// Reject zero or negative amounts.
 pub fn require_non_zero_amount(amount: i128) -> Result<(), KoraError> {
     if amount <= 0 {

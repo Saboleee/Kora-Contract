@@ -7,7 +7,7 @@ use kora_shared::{
     events,
     reentrancy::ReentrancyGuard,
     types::Listing,
-    validation::{bps_of_normalized, require_non_zero_amount, require_valid_fee_bps, safe_add, safe_sub, UPGRADE_TIMELOCK_DELAY},
+    validation::{bps_of_normalized, require_non_zero_amount, require_valid_fee_bps, require_within_max_amount, safe_add, safe_sub, MAX_AMOUNT, UPGRADE_TIMELOCK_DELAY},
 };
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env};
 
@@ -165,6 +165,8 @@ impl MarketplaceContract {
 
         require_non_zero_amount(asking_price)?;
         require_non_zero_amount(face_value)?;
+        require_within_max_amount(asking_price)?;
+        require_within_max_amount(face_value)?;
         kora_shared::validation::require_future_timestamp(&env, funding_deadline)?;
 
         // asking_price must be strictly less than face_value (discount must exist)
@@ -219,6 +221,7 @@ impl MarketplaceContract {
         Self::require_not_paused(&env)?;
 
         require_non_zero_amount(amount)?;
+        require_within_max_amount(amount)?;
 
         let mut listing: Listing = env
             .storage()
