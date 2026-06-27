@@ -1101,6 +1101,30 @@ mod tests {
         assert!(t.mp.try_fund_invoice(&investor, &id, &1_000_000i128).is_ok());
     }
 
+    #[test]
+    fn test_fund_invoice_amount_exactly_equals_remaining_target() {
+        // Test exact boundary: amount == remaining
+        // Listing: asking_price = 9_500_000_000
+        // First fund: 5_000_000_000 (remaining = 4_500_000_000)
+        // Second fund: 4_500_000_000 (remaining = 0, fully funded)
+        let t = deploy();
+        let id = list_one(&t);
+        let inv1 = Address::generate(&t.env);
+        let inv2 = Address::generate(&t.env);
+
+        // First funding: 5B
+        t.mp.fund_invoice(&inv1, &id, &5_000_000_000i128);
+        let listing = t.mp.get_listing(&id);
+        assert_eq!(listing.funded_amount, 5_000_000_000i128);
+        assert!(listing.is_active);
+
+        // Second funding: exactly the remaining 4.5B
+        t.mp.fund_invoice(&inv2, &id, &4_500_000_000i128);
+        let listing = t.mp.get_listing(&id);
+        assert_eq!(listing.funded_amount, 9_500_000_000i128);
+        assert!(!listing.is_active, "Listing should be fully funded and inactive");
+    }
+
     // ── cancel_listing ────────────────────────────────────────────────────────
 
     #[test]
