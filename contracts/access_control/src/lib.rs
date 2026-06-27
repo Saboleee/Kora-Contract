@@ -1236,3 +1236,44 @@ mod tests {
         assert!(result.is_err());
     }
 }
+
+    #[test]
+    fn test_interleaved_pause_and_role_operations_remain_independent() {
+        // Long interleaved sequence: grant → pause → revoke → unpause → re-grant
+        // Verify that pause state and role assignments never affect each other
+        let (env, admin, client) = setup();
+        let target1 = Address::generate(&env);
+        let target2 = Address::generate(&env);
+
+        // Phase 1: Grant roles
+        client.grant_role(&admin, &target1, &Role::Verifier);
+        client.grant_role(&admin, &target2, &Role::Operator);
+        assert!(client.has_role(&target1, &Role::Verifier));
+        assert!(client.has_role(&target2, &Role::Operator));
+        assert!(!client.is_paused());
+
+        // Phase 2: Pause protocol
+        client.pause(&admin);
+        assert!(client.is_paused());
+        assert!(client.has_role(&target1, &Role::Verifier), "Role should survive pause");
+        assert!(client.has_role(&target2, &Role::Operator), "Role should survive pause");
+
+        // Phase 3: Revoke roles while paused
+        client.revoke_role(&admin, &target1);
+        assert!(client.is_paused(), "Pause state should persist after revoke");
+        assert!(!client.has_role(&target1, &Role::Verifier));
+        assert!(client.has_role(&target2, &Role::Operator), "Other role should be unaffected");
+
+        // Phase 4: Unpause protocol
+        client.unpause(&admin);
+        assert!(!client.is_paused());
+        assert!(!client.has_role(&target1, &Role::Verifier), "Revoked role should stay revoked");
+        assert!(client.has_role(&target2, &Role::Operator), "Role should survive unpause");
+
+        // Phase 5: Re-grant role after unpause
+        client.grant_role(&admin, &target1, &Role::Verifier);
+        assert!(!client.is_paused(), "Pause state should remain unpaused");
+        assert!(client.has_role(&target1, &Role::Verifier), "Re-granted role should be assigned");
+        assert!(client.has_role(&target2, &Role::Operator), "Other role should be unaffected");
+    }
+}
