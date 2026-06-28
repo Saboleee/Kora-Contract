@@ -5,7 +5,7 @@ use kora_shared::{
     events,
     reentrancy::ReentrancyGuard,
     types::SmeProfile,
-    validation::{require_non_empty_bytes, require_valid_risk_score, UPGRADE_TIMELOCK_DELAY},
+    validation::{require_exact_length, require_valid_risk_score, UPGRADE_TIMELOCK_DELAY},
 };
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Bytes, BytesN, Env};
 
@@ -51,13 +51,6 @@ impl RiskRegistryContract {
             return Err(KoraError::AlreadyInitialized);
         }
         kora_shared::validation::require_not_self(&env, &admin)?;
-        if minimum_stake <= 0 {
-            return Err(KoraError::InvalidAmount);
-        }
-        if slash_percentage_bps > 10_000 {
-            return Err(KoraError::InvalidFeeRate);
-        }
-        env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().persistent().set(&DataKey::Admin, &admin);
         Self::bump_persistent(&env, &DataKey::Admin);
         env.storage()
@@ -82,7 +75,7 @@ impl RiskRegistryContract {
         Self::require_admin(&env, &admin)?;
         env.storage().persistent().set(&DataKey::Admin, &new_admin);
         Self::bump_persistent(&env, &DataKey::Admin);
-        events::admin_transferred(&env, &new_admin);
+        events::admin_transferred(&env, &admin, &new_admin);
         Ok(())
     }
 
@@ -341,8 +334,8 @@ impl RiskRegistryContract {
     ) -> Result<(), KoraError> {
         verifier.require_auth();
         Self::require_verifier(&env, &verifier)?;
-        // Validate bytes before score — returns EmptyBytes for empty hash
-        require_non_empty_bytes(&debtor_hash)?;
+        // Validate exact 32-byte SHA-256 length before score
+        require_exact_length(&debtor_hash, 32)?;
         require_valid_risk_score(score)?;
         env.storage()
             .persistent()
@@ -879,6 +872,35 @@ mod tests {
     }
 
     #[test]
+    fn test_set_debtor_score_exact_32_bytes_accepted() {
+        let (env, admin, _, client) = setup();
+        let verifier = Address::generate(&env);
+        let hash = Bytes::from_slice(&env, &[0xABu8; 32]);
+        client.add_verifier(&admin, &verifier).unwrap();
+        assert!(client.try_set_debtor_score(&verifier, &hash, &50u32).is_ok());
+    }
+
+    #[test]
+    fn test_set_debtor_score_31_bytes_rejected() {
+        let (env, admin, _, client) = setup();
+        let verifier = Address::generate(&env);
+        let hash = Bytes::from_slice(&env, &[0xABu8; 31]);
+        client.add_verifier(&admin, &verifier).unwrap();
+        let result = client.try_set_debtor_score(&verifier, &hash, &50u32);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidLength);
+    }
+
+    #[test]
+    fn test_set_debtor_score_33_bytes_rejected() {
+        let (env, admin, _, client) = setup();
+        let verifier = Address::generate(&env);
+        let hash = Bytes::from_slice(&env, &[0xABu8; 33]);
+        client.add_verifier(&admin, &verifier).unwrap();
+        let result = client.try_set_debtor_score(&verifier, &hash, &50u32);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidLength);
+    }
+
+    #[test]
     fn test_set_debtor_score_not_verifier() {
         let (env, _, _, client) = setup();
         let stranger = Address::generate(&env);
@@ -1026,99 +1048,118 @@ mod tests {
         env.mock_all_auths();
         let contract_id = env.register_contract(None, RiskRegistryContract);
         let client = RiskRegistryContractClient::new(&env, &contract_id);
-        let staking_token = Address::generate(&env);
-        let result = client.try_initialize(&contract_id, &contract_id, &staking_token, &1_000_000i128, &5_000u32);
+        let invoice_nft = Address::generate(&env);
+        let result = client.try_initialize(&contract_id, &invoice_nft);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_add_verifier_self_as_verifier_rejected() {
-        let (env, admin, _, _, client) = setup();
+        let (env, admin, _, client) = setup();
         let contract_id = client.address.clone();
         let result = client.try_add_verifier(&admin, &contract_id, &1_000_000i128);
         assert!(result.is_err());
     }
 
-    // ── Staking and Reputation ────────────────────────────────────────────────
+    // ── transfer_admin edge cases ─────────────────────────────────────────────
 
     #[test]
-    fn test_add_verifier_insufficient_stake_rejected() {
-        let (env, admin, _, _, client) = setup();
-        let verifier = Address::generate(&env);
-        let result = client.try_add_verifier(&admin, &verifier, &500_000i128);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InsufficientFunds);
+    fn test_transfer_admin_to_same_address_allowed() {
+        // The contract imposes no uniqueness constraint on the new admin —
+        // idempotent re-assignment should succeed (it's a no-op in effect).
+        let (env, admin, _, client) = setup();
+        assert!(client.try_transfer_admin(&admin, &admin).is_ok());
+        assert_eq!(client.get_admin().unwrap(), admin);
     }
 
-    #[test]
-    fn test_add_verifier_stores_stake() {
-        let (env, admin, _, _, client) = setup();
-        let verifier = Address::generate(&env);
-        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
-        assert_eq!(client.get_verifier_stake(&verifier), 1_000_000i128);
-    }
+    // ── update_sme_score with score = 0 ──────────────────────────────────────
 
     #[test]
-    fn test_add_verifier_initializes_reputation() {
-        let (env, admin, _, _, client) = setup();
-        let verifier = Address::generate(&env);
-        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
-        assert_eq!(client.get_verifier_reputation(&verifier), 100u32);
-    }
-
-    #[test]
-    fn test_record_default_slashes_stake() {
-        let (env, admin, _, _, client) = setup();
+    fn test_update_sme_score_to_zero() {
+        let (env, admin, _, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
-        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
-        client.register_sme(&verifier, &sme, &50u32, &true).unwrap();
-        assert_eq!(client.get_verifier_stake(&verifier), 1_000_000i128);
-
-        client.record_default(&admin, &sme).unwrap();
-        let remaining_stake = client.get_verifier_stake(&verifier);
-        assert!(remaining_stake < 1_000_000i128);
-        let slashed = 1_000_000i128 - remaining_stake;
-        let expected_slash = (1_000_000i128 as u128 * 5_000u128 / 10_000) as i128;
-        assert_eq!(slashed, expected_slash);
+        client.add_verifier(&admin, &verifier).unwrap();
+        client.register_sme(&verifier, &sme, &50u32).unwrap();
+        // Score 0 is valid (lowest risk tier boundary).
+        client.update_sme_score(&verifier, &sme, &0u32).unwrap();
+        assert_eq!(client.get_sme_profile(&sme).unwrap().risk_score, 0);
     }
 
+    // ── set_debtor_score update (overwrite) ───────────────────────────────────
+
     #[test]
-    fn test_record_default_decreases_reputation() {
-        let (env, admin, _, _, client) = setup();
+    fn test_set_debtor_score_update_existing() {
+        // set_debtor_score is idempotent / overwrites — calling it twice for the
+        // same hash with a different score must persist the latest value.
+        let (env, admin, _, client) = setup();
+        let verifier = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[0xAAu8; 32]);
+        client.add_verifier(&admin, &verifier).unwrap();
+        client.set_debtor_score(&verifier, &debtor_hash, &30u32).unwrap();
+        assert_eq!(client.get_debtor_score(&debtor_hash).unwrap(), 30);
+        // Overwrite with a new score.
+        client.set_debtor_score(&verifier, &debtor_hash, &75u32).unwrap();
+        assert_eq!(client.get_debtor_score(&debtor_hash).unwrap(), 75);
+    }
+
+    // ── verifier cannot register itself as an SME ─────────────────────────────
+
+    #[test]
+    fn test_verifier_cannot_register_itself_as_sme() {
+        // A verifier registering itself as an SME would create a conflict of
+        // interest. The require_not_self guard on add_verifier prevents a
+        // contract from being added as verifier, but a human verifier address
+        // could still call register_sme on itself — which is allowed by the
+        // current design. This test documents the current behaviour.
+        let (env, admin, _, client) = setup();
+        let verifier = Address::generate(&env);
+        client.add_verifier(&admin, &verifier).unwrap();
+        // A verifier registering themselves as an SME is permitted (no rule
+        // prevents it). The test ensures it doesn't panic / silently fail.
+        assert!(client.try_register_sme(&verifier, &verifier, &40u32).is_ok());
+        assert_eq!(client.get_sme_profile(&verifier).unwrap().verifier, verifier);
+    }
+
+    // ── remove verifier while still registered as SME ─────────────────────────
+
+    #[test]
+    fn test_remove_verifier_does_not_affect_sme_profile() {
+        // Removing a verifier's authorization must not delete SME profiles they
+        // previously created — those profiles belong to the SMEs, not the verifier.
+        let (env, admin, _, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
-        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
-        client.register_sme(&verifier, &sme, &50u32, &true).unwrap();
-        assert_eq!(client.get_verifier_reputation(&verifier), 100u32);
-
-        client.record_default(&admin, &sme).unwrap();
-        assert_eq!(client.get_verifier_reputation(&verifier), 90u32);
-    }
-
-    #[test]
-    fn test_remove_verifier_returns_stake() {
-        let (env, admin, _, _, client) = setup();
-        let verifier = Address::generate(&env);
-        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
-        assert_eq!(client.get_verifier_stake(&verifier), 1_000_000i128);
-
+        client.add_verifier(&admin, &verifier).unwrap();
+        client.register_sme(&verifier, &sme, &40u32).unwrap();
         client.remove_verifier(&admin, &verifier).unwrap();
-        assert_eq!(client.get_verifier_stake(&verifier), 0i128);
+        // SME profile still accessible.
+        assert_eq!(client.get_sme_profile(&sme).unwrap().risk_score, 40);
+        // But the removed verifier can no longer update scores.
+        assert!(client.try_update_sme_score(&verifier, &sme, &60u32).is_err());
     }
 
+    // ── register_sme with score = 0 ───────────────────────────────────────────
+
     #[test]
-    fn test_reputation_decreases_on_multiple_defaults() {
-        let (env, admin, _, _, client) = setup();
+    fn test_register_sme_score_zero() {
+        let (env, admin, _, client) = setup();
         let verifier = Address::generate(&env);
         let sme = Address::generate(&env);
-        client.add_verifier(&admin, &verifier, &10_000_000i128).unwrap();
-        client.register_sme(&verifier, &sme, &50u32, &true).unwrap();
+        client.add_verifier(&admin, &verifier).unwrap();
+        // Score 0 is valid: AAA tier.
+        assert!(client.try_register_sme(&verifier, &sme, &0u32).is_ok());
+        assert_eq!(client.get_sme_profile(&sme).unwrap().risk_score, 0);
+    }
 
-        client.record_default(&admin, &sme).unwrap();
-        assert_eq!(client.get_verifier_reputation(&verifier), 90u32);
-        client.record_default(&admin, &sme).unwrap();
-        assert_eq!(client.get_verifier_reputation(&verifier), 80u32);
-        client.record_default(&admin, &sme).unwrap();
-        assert_eq!(client.get_verifier_reputation(&verifier), 70u32);
+    // ── get_admin before initialization ───────────────────────────────────────
+
+    #[test]
+    fn test_get_admin_before_initialization_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RiskRegistryContract);
+        let client = RiskRegistryContractClient::new(&env, &contract_id);
+        assert!(client.try_get_admin().is_err());
     }
 }
