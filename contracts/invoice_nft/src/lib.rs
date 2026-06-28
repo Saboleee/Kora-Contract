@@ -18,8 +18,9 @@ use kora_shared::{
     reentrancy::ReentrancyGuard,
     types::{Invoice, InvoiceStatus, RiskTier},
     validation::{
-        require_future_timestamp, require_non_empty_bytes, require_non_empty_string,
-        require_non_zero_amount, require_valid_risk_score, UPGRADE_TIMELOCK_DELAY,
+        require_future_timestamp, require_max_length_bytes, require_max_length_string,
+        require_non_empty_bytes, require_non_empty_string, require_non_zero_amount,
+        require_valid_risk_score, MAX_DEBTOR_HASH_LEN, MAX_IPFS_CID_LEN, UPGRADE_TIMELOCK_DELAY,
     },
 };
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol};
@@ -62,8 +63,45 @@ pub enum DataKey {
     MigrationVersion,
     /// Pending upgrade proposal: (wasm_hash, proposed_at_timestamp).
     UpgradeProposal,
+    /// Instance key: authorized marketplace contract address
+    Marketplace,
+    /// Instance key: authorized financing pool contract address
+    FinancingPool,
 }
 
+// ── Migration helpers ─────────────────────────────────────────────────────────
+//
+// When Invoice gains new fields, keep the PREVIOUS struct definition here so
+// migrate() can deserialize stale records from persistent storage.
+//
+// Pattern:
+//   1. Copy the old Invoice definition below as InvoiceV{N}.
+//   2. Add the new field(s) to Invoice in kora-shared/src/types.rs.
+//   3. Increment MigrationVersion to N+1 in migrate().
+//   4. In migrate(), read as InvoiceV{N}, convert to Invoice, write back.
+//   5. After all live nodes have run migrate(), the old InvoiceV{N} struct
+//      can be removed in the following upgrade cycle.
+
+/// Schema v1 of Invoice — identical to the original struct that existed before
+/// the `notes` field was added.  Used by migrate() to deserialize stale records
+/// from persistent storage so they can be rewritten in the current schema (v2).
+#[contracttype]
+#[derive(Clone)]
+pub struct InvoiceV1 {
+    pub id: u64,
+    pub sme: Address,
+    pub debtor_hash: Bytes,
+    pub amount: i128,
+    pub currency: Symbol,
+    pub due_date: u64,
+    pub ipfs_cid: String,
+    pub risk_score: u32,
+    pub risk_tier: kora_shared::types::RiskTier,
+    pub status: kora_shared::types::InvoiceStatus,
+    pub created_at: u64,
+    pub funded_at: Option<u64>,
+    pub repaid_at: Option<u64>,
+}
 
 // ── Contract ─────────────────────────────────────────────────────────────────
 
@@ -93,30 +131,98 @@ impl InvoiceNftContract {
     }
 
     /// Idempotent migration function. Performs any necessary schema upgrades.
-    /// Must be called by admin after contract deployment to complete setup.
-    /// Safe to call multiple times — subsequent calls are no-ops.
+    ///
+    /// Must be called by admin immediately after a WASM upgrade that changes a
+    /// `#[contracttype]` struct.  The function is safe to call multiple times:
+    /// each version gate is a no-op once the ledger has already been upgraded
+    /// past that version.
+    ///
+    /// See docs/MIGRATIONS.md for the full runbook and a description of each
+    /// version's changes.
     pub fn migrate(env: Env, admin: Address) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
 
-        // Get current migration version (default to 0 if not set, indicating fresh contract)
         let current_version: u32 = env
             .storage()
             .instance()
             .get(&DataKey::MigrationVersion)
             .unwrap_or(0);
 
-        // Version 0 -> 1: Initial setup (ensure migration version is set)
+        // Version 0 -> 1: Initial setup (marks the baseline schema version).
         if current_version < 1 {
             env.storage()
                 .instance()
                 .set(&DataKey::MigrationVersion, &1u32);
         }
 
-        // Future migrations would be added here:
-        // if current_version < 2 { ... migrate to v2 ... }
-        // if current_version < 3 { ... migrate to v3 ... }
+        // Version 1 -> 2: Invoice gained `notes: Option<String>`.
+        //
+        // Old records in persistent storage are still encoded as InvoiceV1 (no
+        // `notes` field).  Reading them as `Invoice` (v2) would panic because
+        // the XDR field count has changed.  We therefore:
+        //   1. Read each record as InvoiceV1 (the old encoding).
+        //   2. Re-encode it as Invoice (v2) with notes = None.
+        //   3. Overwrite the slot so future reads use the new codec.
+        if current_version < 2 {
+            let next_id: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::NextId)
+                .unwrap_or(1);
 
+            // Iterate every allocated invoice ID and backfill.
+            let mut id: u64 = 1;
+            while id < next_id {
+                let key = DataKey::Invoice(id);
+                // Records minted AFTER the WASM upgrade already carry notes and
+                // decode as Invoice directly — skip them.
+                if let Some(old) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, InvoiceV1>(&key)
+                {
+                    let upgraded = Invoice {
+                        id: old.id,
+                        sme: old.sme,
+                        debtor_hash: old.debtor_hash,
+                        amount: old.amount,
+                        currency: old.currency,
+                        due_date: old.due_date,
+                        ipfs_cid: old.ipfs_cid,
+                        risk_score: old.risk_score,
+                        risk_tier: old.risk_tier,
+                        status: old.status,
+                        created_at: old.created_at,
+                        funded_at: old.funded_at,
+                        repaid_at: old.repaid_at,
+                        notes: None,
+                    };
+                    env.storage().persistent().set(&key, &upgraded);
+                }
+                id += 1;
+            }
+
+            env.storage()
+                .instance()
+                .set(&DataKey::MigrationVersion, &2u32);
+        }
+
+        Ok(())
+    }
+
+    /// Set the authorized marketplace and financing pool contract addresses.
+    /// Must be called by admin after deployment to enable status transitions.
+    pub fn set_authorized_callers(
+        env: Env,
+        admin: Address,
+        marketplace: Address,
+        financing_pool: Address,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::Marketplace, &marketplace);
+        env.storage().instance().set(&DataKey::FinancingPool, &financing_pool);
         Ok(())
     }
 
@@ -130,6 +236,7 @@ impl InvoiceNftContract {
         due_date: u64,
         ipfs_cid: String,
         risk_score: u32,
+        notes: Option<String>,
     ) -> Result<u64, KoraError> {
         sme.require_auth();
         Self::require_not_paused(&env)?;
@@ -139,7 +246,9 @@ impl InvoiceNftContract {
         require_future_timestamp(&env, due_date)?;
         require_valid_risk_score(risk_score)?;
         require_non_empty_bytes(&debtor_hash)?;
+        require_max_length_bytes(&debtor_hash, MAX_DEBTOR_HASH_LEN)?;
         require_non_empty_string(&ipfs_cid)?;
+        require_max_length_string(&ipfs_cid, MAX_IPFS_CID_LEN)?;
 
         let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
 
@@ -151,12 +260,14 @@ impl InvoiceNftContract {
             currency,
             due_date,
             ipfs_cid,
+            metadata_hash: Bytes::new(&env),
             risk_score,
             risk_tier: RiskTier::from_score(risk_score),
             status: InvoiceStatus::Created,
             created_at: env.ledger().timestamp(),
             funded_at: None,
             repaid_at: None,
+            notes,
         };
 
         env.storage()
@@ -167,7 +278,7 @@ impl InvoiceNftContract {
             &(id.checked_add(1).ok_or(KoraError::ArithmeticOverflow)?),
         );
 
-        events::invoice_created(&env, id, &sme, amount);
+        events::invoice_created(&env, id, &sme, invoice.amount);
         Ok(id)
     }
 
@@ -182,6 +293,7 @@ impl InvoiceNftContract {
     /// **Security:** Requires auth from the caller. Validates that the invoice is in `Created` status.
     pub fn set_listed(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
         caller.require_auth();
+        Self::require_authorized_caller(&env, &caller, &[DataKey::Marketplace])?;
         Self::require_not_paused(&env)?;
         let _guard = ReentrancyGuard::new(&env)?;
         let mut invoice = Self::load_invoice(&env, invoice_id)?;
@@ -208,6 +320,7 @@ impl InvoiceNftContract {
     /// **Security:** Requires auth from the caller. Validates that the invoice is in `Listed` status.
     pub fn set_funded(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
         caller.require_auth();
+        Self::require_authorized_caller(&env, &caller, &[DataKey::FinancingPool])?;
         Self::require_not_paused(&env)?;
         let _guard = ReentrancyGuard::new(&env)?;
         let mut invoice = Self::load_invoice(&env, invoice_id)?;
@@ -234,6 +347,7 @@ impl InvoiceNftContract {
     /// **Security:** Requires auth from the caller. Validates that the invoice is in `Funded` status.
     pub fn set_repaid(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
         caller.require_auth();
+        Self::require_authorized_caller(&env, &caller, &[DataKey::FinancingPool])?;
         Self::require_not_paused(&env)?;
         let mut invoice = Self::load_invoice(&env, invoice_id)?;
         if invoice.status != InvoiceStatus::Funded {
@@ -292,6 +406,50 @@ impl InvoiceNftContract {
         Self::load_invoice(&env, invoice_id)
     }
 
+    /// Commit a SHA-256 content-integrity hash of the off-chain metadata document.
+    ///
+    /// This binds the invoice on-chain to the exact bytes of the document referenced by
+    /// `ipfs_cid`, so a fetched document can be verified even if the underlying CID content
+    /// were ever mutated. Write-once: the hash can only be committed while empty and while the
+    /// invoice is still in `Created` status, after which it is immutable.
+    ///
+    /// **Parameters:**
+    /// - `sme` — The invoice owner (must match `invoice.sme`).
+    /// - `invoice_id` — The ID of the invoice to commit the hash for.
+    /// - `metadata_hash` — SHA-256 (32 bytes) of the canonical off-chain document.
+    ///
+    /// **Security:** Requires auth from the invoice's SME. Rejects empty hashes, already-committed
+    /// invoices, and invoices that have left `Created` status.
+    pub fn commit_metadata_hash(
+        env: Env,
+        sme: Address,
+        invoice_id: u64,
+        metadata_hash: Bytes,
+    ) -> Result<(), KoraError> {
+        sme.require_auth();
+        Self::require_not_paused(&env)?;
+        let _guard = ReentrancyGuard::new(&env)?;
+
+        require_non_empty_bytes(&metadata_hash)?;
+
+        let mut invoice = Self::load_invoice(&env, invoice_id)?;
+        if invoice.sme != sme {
+            return Err(KoraError::Unauthorized);
+        }
+        if invoice.status != InvoiceStatus::Created {
+            return Err(KoraError::InvalidInvoiceStatus);
+        }
+        if invoice.metadata_hash.len() != 0 {
+            return Err(KoraError::AlreadyInitialized);
+        }
+
+        invoice.metadata_hash = metadata_hash;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Invoice(invoice_id), &invoice);
+        Ok(())
+    }
+
     /// Get the next invoice ID that will be allocated.
     ///
     /// **Returns:** The ID of the next invoice to be minted (starting at 1).
@@ -347,6 +505,17 @@ impl InvoiceNftContract {
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
+
+    fn require_authorized_caller(env: &Env, caller: &Address, allowed: &[DataKey]) -> Result<(), KoraError> {
+        for key in allowed {
+            if let Some(addr) = env.storage().instance().get::<DataKey, Address>(key) {
+                if &addr == caller {
+                    return Ok(());
+                }
+            }
+        }
+        Err(KoraError::Unauthorized)
+    }
 
     fn load_invoice(env: &Env, id: u64) -> Result<Invoice, KoraError> {
         env.storage()
@@ -505,7 +674,7 @@ mod tests {
             &Symbol::new(&env, "USDC"),
             &due_date,
             &ipfs_cid,
-            &25u32,
+            &25u32, &None,
         );
         assert_eq!(id, 1);
 
@@ -531,7 +700,7 @@ mod tests {
         let due_date = env.ledger().timestamp() + 86_400;
         let result = client.try_mint_invoice(
             &sme, &debtor_hash, &0i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
         );
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
     }
@@ -548,7 +717,7 @@ mod tests {
         let due_date = env.ledger().timestamp() + 86_400;
         let result = client.try_mint_invoice(
             &sme, &debtor_hash, &-1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
         );
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
     }
@@ -566,7 +735,7 @@ mod tests {
 
         let result = client.try_mint_invoice(
             &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
         );
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidDueDate);
     }
@@ -584,7 +753,7 @@ mod tests {
 
         let result = client.try_mint_invoice(
             &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
         );
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidDueDate);
     }
@@ -601,7 +770,7 @@ mod tests {
         let due_date = env.ledger().timestamp() + 86_400;
         let result = client.try_mint_invoice(
             &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &101u32,
+            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &101u32, &None,
         );
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidRiskScore);
     }
@@ -618,9 +787,9 @@ mod tests {
         let due_date = env.ledger().timestamp() + 86_400;
         let result = client.try_mint_invoice(
             &sme, &debtor_hash, &1_000_000_000i128,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
+            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32, &None,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::EmptyString);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::EmptyBytes);
     }
 
     #[test]
@@ -642,7 +811,7 @@ mod tests {
             &Symbol::new(&env, "USDC"),
             &due_date,
             &ipfs_cid,
-            &10u32,
+            &10u32, &None,
         );
         let id2 = client.mint_invoice(
             &sme,
@@ -651,7 +820,7 @@ mod tests {
             &Symbol::new(&env, "USDC"),
             &due_date,
             &ipfs_cid,
-            &20u32,
+            &20u32, &None,
         );
 
         assert_eq!(id1, 1);
@@ -673,7 +842,7 @@ mod tests {
         let large_amount = i128::MAX;
         let id = client.mint_invoice(
             &sme, &debtor_hash, &large_amount,
-            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &50u32,
+            &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &50u32, &None,
         );
         assert_eq!(client.get_invoice(&id).amount, large_amount);
     }
@@ -782,7 +951,7 @@ mod tests {
             &Symbol::new(&env, "USDC"),
             &due_date,
             &ipfs_cid,
-            &10u32,
+            &10u32, &None,
         );
 
     #[test]
@@ -813,7 +982,7 @@ mod tests {
             &Symbol::new(&env, "USDC"),
             &due_date,
             &ipfs_cid,
-            &10u32,
+            &10u32, &None,
         );
 
     #[test]
@@ -874,7 +1043,7 @@ mod tests {
             &Symbol::new(&env, "USDC"),
             &due_date,
             &ipfs_cid,
-            &10u32,
+            &10u32, &None,
         );
         let marketplace = Address::generate(&env);
         client.set_listed(&marketplace, &id);
@@ -906,7 +1075,7 @@ mod tests {
             &Symbol::new(&env, "USDC"),
             &due_date,
             &ipfs_cid,
-            &10u32,
+            &10u32, &None,
         );
         let marketplace = Address::generate(&env);
         client.set_listed(&marketplace, &id);
@@ -939,7 +1108,7 @@ mod tests {
             &Symbol::new(&env, "USDC"),
             &due_date,
             &ipfs_cid,
-            &10u32,
+            &10u32, &None,
         );
         let marketplace = Address::generate(&env);
         client.set_listed(&marketplace, &id);
@@ -973,7 +1142,7 @@ mod tests {
             &Symbol::new(&env, "USDC"),
             &due_date,
             &ipfs_cid,
-            &50u32,
+            &50u32, &None,
         );
 
         let invoice = client.get_invoice(&id);
@@ -998,7 +1167,7 @@ mod tests {
             &Symbol::new(&env, "USDC"),
             &due_date,
             &ipfs_cid,
-            &10u32,
+            &10u32, &None,
         );
 
         let id2 = client.mint_invoice(
@@ -1008,7 +1177,7 @@ mod tests {
             &Symbol::new(&env, "EURC"),
             &due_date,
             &ipfs_cid,
-            &20u32,
+            &20u32, &None,
         );
 
         let invoice1 = client.get_invoice(&id1);
@@ -1036,7 +1205,7 @@ mod tests {
             &Symbol::new(&env, "USDC"),
             &due_date,
             &ipfs_cid,
-            &10u32,
+            &10u32, &None,
         );
 
         let invoice1 = client.get_invoice(&id);
@@ -1066,7 +1235,7 @@ mod tests {
             &Symbol::new(&env, "USDC"),
             &due_date,
             &ipfs_cid,
-            &10u32,
+            &10u32, &None,
         );
 
         let invoice = client.get_invoice(&id);
@@ -1100,7 +1269,7 @@ mod tests {
             &Symbol::new(&env, "USDC"),
             &due_date,
             &ipfs_cid,
-            &10u32,
+            &10u32, &None,
         );
 
         let marketplace = Address::generate(&env);
@@ -1136,7 +1305,7 @@ mod tests {
             &Symbol::new(&env, "USDC"),
             &due_date,
             &ipfs_cid,
-            &10u32,
+            &10u32, &None,
         );
 
         let marketplace = Address::generate(&env);
@@ -1176,11 +1345,11 @@ mod tests {
             &Symbol::new(&env, "USDC"),
             &due_date,
             &ipfs_cid,
-            &10u32,
+            &10u32, &None,
         );
         let id2 = client.mint_invoice(
             &sme, &debtor_hash, &2_000_000_000i128,
-            &Symbol::new(&env, "EURC"), &due_date, &ipfs_cid, &20u32,
+            &Symbol::new(&env, "EURC"), &due_date, &ipfs_cid, &20u32, &None,
         );
 
         assert_eq!(client.get_invoice(&id1).currency, Symbol::new(&env, "USDC"));
@@ -1208,7 +1377,7 @@ mod tests {
             &Symbol::new(&env, "USDC"),
             &due_date,
             &ipfs_cid,
-            &20u32,
+            &20u32, &None,
         );
         assert_eq!(client.get_invoice(&id1).risk_tier, RiskTier::AAA);
 
@@ -1219,7 +1388,7 @@ mod tests {
             &Symbol::new(&env, "USDC"),
             &due_date,
             &ipfs_cid,
-            &21u32,
+            &21u32, &None,
         );
         assert_eq!(client.get_invoice(&id2).risk_tier, RiskTier::AA);
     }
@@ -1297,7 +1466,7 @@ mod tests {
             &Symbol::new(&env, "USDC"),
             &due_date,
             &ipfs_cid,
-            &50u32,
+            &50u32, &None,
         );
 
         let invoice_before = client.get_invoice(&invoice_id);
@@ -1311,6 +1480,62 @@ mod tests {
         assert_eq!(invoice_before.sme, invoice_after.sme);
         assert_eq!(invoice_before.amount, invoice_after.amount);
         assert_eq!(invoice_before.status, invoice_after.status);
+    }
+
+    /// Proves that pre-migration records (written in InvoiceV1 format, without
+    /// the `notes` field) are correctly backfilled by migrate() and remain
+    /// fully readable via get_invoice() after the migration runs.
+    ///
+    /// The test simulates the v1 → v2 upgrade by:
+    ///   1. Manually writing an InvoiceV1 record directly into persistent storage
+    ///      (bypassing mint_invoice so the record has no `notes` field).
+    ///   2. Setting the stored MigrationVersion to 1 (pre-migration).
+    ///   3. Calling migrate(), which should detect version < 2 and backfill.
+    ///   4. Asserting that get_invoice() now returns a valid Invoice with notes = None.
+    #[test]
+    fn test_migrate_v1_to_v2_backfills_notes_field() {
+        let (env, admin, client) = setup();
+        let sme = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[1u8; 32]);
+        let ipfs_cid = String::from_str(
+            &env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+        let currency = Symbol::new(&env, "USDC");
+
+        // Write a pre-migration record directly in InvoiceV1 format.
+        let old_record = InvoiceV1 {
+            id: 1u64,
+            sme: sme.clone(),
+            debtor_hash: debtor_hash.clone(),
+            amount: 1_000_000_000i128,
+            currency: currency.clone(),
+            due_date,
+            ipfs_cid: ipfs_cid.clone(),
+            risk_score: 30u32,
+            risk_tier: kora_shared::types::RiskTier::AA,
+            status: kora_shared::types::InvoiceStatus::Created,
+            created_at: env.ledger().timestamp(),
+            funded_at: None,
+            repaid_at: None,
+        };
+        env.storage().persistent().set(&DataKey::Invoice(1u64), &old_record);
+        // Advance NextId so migrate() knows to scan ID 1.
+        env.storage().instance().set(&DataKey::NextId, &2u64);
+        // Force stored version back to 1 so migrate() re-runs the v1→v2 step.
+        env.storage().instance().set(&DataKey::MigrationVersion, &1u32);
+
+        // Run migration — should rewrite the record with notes = None.
+        client.migrate(&admin);
+
+        // Post-migration: record must be readable as Invoice (v2) with notes = None.
+        let invoice = client.get_invoice(&1u64);
+        assert_eq!(invoice.id, 1u64);
+        assert_eq!(invoice.sme, sme);
+        assert_eq!(invoice.amount, 1_000_000_000i128);
+        assert_eq!(invoice.risk_score, 30u32);
+        assert_eq!(invoice.notes, None);
     }
 
     #[test]
@@ -1335,7 +1560,7 @@ mod tests {
             &Symbol::new(&env, "USDC"),
             &due_date,
             &ipfs_cid,
-            &50u32,
+            &50u32, &None,
         );
 
         let invoice = client.get_invoice(&invoice_id);

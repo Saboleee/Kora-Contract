@@ -1,11 +1,24 @@
 use soroban_sdk::{Address, Bytes, Env, String};
 use crate::errors::KoraError;
-use soroban_sdk::{Bytes, Env, String};
 
 /// Minimum timelock delay for upgrade proposals (24 hours in seconds).
 pub const UPGRADE_TIMELOCK_DELAY: u64 = 86_400;
 
 // ── Amount guards ─────────────────────────────────────────────────────────────
+
+/// Upper bound for i128 amounts — prevents overflow in intermediate arithmetic
+/// (e.g., multiplication by fee/bps values). Any amount above this ceiling risks
+/// overflow when multiplied by 10_000 (max bps).
+pub const MAX_AMOUNT: i128 = i128::MAX / 2;
+
+/// Reject amounts that exceed the overflow-safety ceiling.
+#[inline]
+pub fn require_within_max_amount(amount: i128) -> Result<(), KoraError> {
+    if amount > MAX_AMOUNT {
+        return Err(KoraError::InvalidAmount);
+    }
+    Ok(())
+}
 
 /// Reject zero or negative amounts.
 pub fn require_non_zero_amount(amount: i128) -> Result<(), KoraError> {
@@ -86,6 +99,30 @@ pub fn require_non_empty_bytes(b: &Bytes) -> Result<(), KoraError> {
     }
     Ok(())
 }
+
+/// Reject strings whose length exceeds `max_bytes`.
+#[inline]
+pub fn require_max_length_string(s: &String, max_bytes: u32) -> Result<(), KoraError> {
+    if s.len() > max_bytes {
+        return Err(KoraError::FieldTooLong);
+    }
+    Ok(())
+}
+
+/// Reject byte slices whose length exceeds `max_bytes`.
+#[inline]
+pub fn require_max_length_bytes(b: &Bytes, max_bytes: u32) -> Result<(), KoraError> {
+    if b.len() > max_bytes {
+        return Err(KoraError::FieldTooLong);
+    }
+    Ok(())
+}
+
+/// Maximum allowed byte length for an IPFS CID stored on-chain.
+pub const MAX_IPFS_CID_LEN: u32 = 128;
+
+/// Maximum allowed byte length for a debtor hash stored on-chain.
+pub const MAX_DEBTOR_HASH_LEN: u32 = 64;
 
 // ── Safe arithmetic ───────────────────────────────────────────────────────────
 
@@ -475,6 +512,34 @@ mod tests {
     #[test]
     fn test_bps_of_normalized_negative_rejected() {
         assert!(bps_of_normalized(-1_000, 50, 6).is_err());
+    }
+
+    #[test]
+    fn test_require_max_length_string_at_max_ok() {
+        let env = Env::default();
+        let s = SorobanString::from_str(&env, "a".repeat(128 as usize).as_str());
+        assert!(require_max_length_string(&s, 128).is_ok());
+    }
+
+    #[test]
+    fn test_require_max_length_string_exceeds_max_fails() {
+        let env = Env::default();
+        let s = SorobanString::from_str(&env, "a".repeat(129 as usize).as_str());
+        assert!(require_max_length_string(&s, 128).is_err());
+    }
+
+    #[test]
+    fn test_require_max_length_bytes_at_max_ok() {
+        let env = Env::default();
+        let b = Bytes::from_slice(&env, &[0u8; 64]);
+        assert!(require_max_length_bytes(&b, 64).is_ok());
+    }
+
+    #[test]
+    fn test_require_max_length_bytes_exceeds_max_fails() {
+        let env = Env::default();
+        let b = Bytes::from_slice(&env, &[0u8; 65]);
+        assert!(require_max_length_bytes(&b, 64).is_err());
     }
 }
 
