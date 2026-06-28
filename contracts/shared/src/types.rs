@@ -47,7 +47,8 @@ pub struct Invoice {
     pub currency: Symbol,   // e.g. USDC, EURC
     pub due_date: u64,      // Unix timestamp
     pub ipfs_cid: String,   // IPFS CID of full invoice metadata
-    pub risk_score: u32,    // 0–100
+    pub metadata_hash: Bytes, // SHA-256 content commitment of the off-chain metadata document (empty until committed)
+    pub risk_score: u32,      // 0–100
     pub risk_tier: RiskTier,
     pub status: InvoiceStatus,
     pub created_at: u64,

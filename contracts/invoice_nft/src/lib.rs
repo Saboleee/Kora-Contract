@@ -18,8 +18,9 @@ use kora_shared::{
     reentrancy::ReentrancyGuard,
     types::{Invoice, InvoiceStatus, RiskTier},
     validation::{
-        require_future_timestamp, require_non_empty_bytes, require_non_empty_string,
-        require_non_zero_amount, require_valid_risk_score, UPGRADE_TIMELOCK_DELAY,
+        require_future_timestamp, require_max_length_bytes, require_max_length_string,
+        require_non_empty_bytes, require_non_empty_string, require_non_zero_amount,
+        require_valid_risk_score, MAX_DEBTOR_HASH_LEN, MAX_IPFS_CID_LEN, UPGRADE_TIMELOCK_DELAY,
     },
 };
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol};
@@ -62,6 +63,10 @@ pub enum DataKey {
     MigrationVersion,
     /// Pending upgrade proposal: (wasm_hash, proposed_at_timestamp).
     UpgradeProposal,
+    /// Instance key: authorized marketplace contract address
+    Marketplace,
+    /// Instance key: authorized financing pool contract address
+    FinancingPool,
 }
 
 
@@ -120,6 +125,21 @@ impl InvoiceNftContract {
         Ok(())
     }
 
+    /// Set the authorized marketplace and financing pool contract addresses.
+    /// Must be called by admin after deployment to enable status transitions.
+    pub fn set_authorized_callers(
+        env: Env,
+        admin: Address,
+        marketplace: Address,
+        financing_pool: Address,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::Marketplace, &marketplace);
+        env.storage().instance().set(&DataKey::FinancingPool, &financing_pool);
+        Ok(())
+    }
+
     /// Mint a new invoice NFT. Caller must be a verified SME.
     pub fn mint_invoice(
         env: Env,
@@ -139,7 +159,9 @@ impl InvoiceNftContract {
         require_future_timestamp(&env, due_date)?;
         require_valid_risk_score(risk_score)?;
         require_non_empty_bytes(&debtor_hash)?;
+        require_max_length_bytes(&debtor_hash, MAX_DEBTOR_HASH_LEN)?;
         require_non_empty_string(&ipfs_cid)?;
+        require_max_length_string(&ipfs_cid, MAX_IPFS_CID_LEN)?;
 
         let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
 
@@ -151,6 +173,7 @@ impl InvoiceNftContract {
             currency,
             due_date,
             ipfs_cid,
+            metadata_hash: Bytes::new(&env),
             risk_score,
             risk_tier: RiskTier::from_score(risk_score),
             status: InvoiceStatus::Created,
@@ -182,6 +205,7 @@ impl InvoiceNftContract {
     /// **Security:** Requires auth from the caller. Validates that the invoice is in `Created` status.
     pub fn set_listed(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
         caller.require_auth();
+        Self::require_authorized_caller(&env, &caller, &[DataKey::Marketplace])?;
         Self::require_not_paused(&env)?;
         let _guard = ReentrancyGuard::new(&env)?;
         let mut invoice = Self::load_invoice(&env, invoice_id)?;
@@ -208,6 +232,7 @@ impl InvoiceNftContract {
     /// **Security:** Requires auth from the caller. Validates that the invoice is in `Listed` status.
     pub fn set_funded(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
         caller.require_auth();
+        Self::require_authorized_caller(&env, &caller, &[DataKey::FinancingPool])?;
         Self::require_not_paused(&env)?;
         let _guard = ReentrancyGuard::new(&env)?;
         let mut invoice = Self::load_invoice(&env, invoice_id)?;
@@ -234,6 +259,7 @@ impl InvoiceNftContract {
     /// **Security:** Requires auth from the caller. Validates that the invoice is in `Funded` status.
     pub fn set_repaid(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
         caller.require_auth();
+        Self::require_authorized_caller(&env, &caller, &[DataKey::FinancingPool])?;
         Self::require_not_paused(&env)?;
         let mut invoice = Self::load_invoice(&env, invoice_id)?;
         if invoice.status != InvoiceStatus::Funded {
@@ -292,6 +318,50 @@ impl InvoiceNftContract {
         Self::load_invoice(&env, invoice_id)
     }
 
+    /// Commit a SHA-256 content-integrity hash of the off-chain metadata document.
+    ///
+    /// This binds the invoice on-chain to the exact bytes of the document referenced by
+    /// `ipfs_cid`, so a fetched document can be verified even if the underlying CID content
+    /// were ever mutated. Write-once: the hash can only be committed while empty and while the
+    /// invoice is still in `Created` status, after which it is immutable.
+    ///
+    /// **Parameters:**
+    /// - `sme` — The invoice owner (must match `invoice.sme`).
+    /// - `invoice_id` — The ID of the invoice to commit the hash for.
+    /// - `metadata_hash` — SHA-256 (32 bytes) of the canonical off-chain document.
+    ///
+    /// **Security:** Requires auth from the invoice's SME. Rejects empty hashes, already-committed
+    /// invoices, and invoices that have left `Created` status.
+    pub fn commit_metadata_hash(
+        env: Env,
+        sme: Address,
+        invoice_id: u64,
+        metadata_hash: Bytes,
+    ) -> Result<(), KoraError> {
+        sme.require_auth();
+        Self::require_not_paused(&env)?;
+        let _guard = ReentrancyGuard::new(&env)?;
+
+        require_non_empty_bytes(&metadata_hash)?;
+
+        let mut invoice = Self::load_invoice(&env, invoice_id)?;
+        if invoice.sme != sme {
+            return Err(KoraError::Unauthorized);
+        }
+        if invoice.status != InvoiceStatus::Created {
+            return Err(KoraError::InvalidInvoiceStatus);
+        }
+        if invoice.metadata_hash.len() != 0 {
+            return Err(KoraError::AlreadyInitialized);
+        }
+
+        invoice.metadata_hash = metadata_hash;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Invoice(invoice_id), &invoice);
+        Ok(())
+    }
+
     /// Get the next invoice ID that will be allocated.
     ///
     /// **Returns:** The ID of the next invoice to be minted (starting at 1).
@@ -347,6 +417,17 @@ impl InvoiceNftContract {
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
+
+    fn require_authorized_caller(env: &Env, caller: &Address, allowed: &[DataKey]) -> Result<(), KoraError> {
+        for key in allowed {
+            if let Some(addr) = env.storage().instance().get::<DataKey, Address>(key) {
+                if &addr == caller {
+                    return Ok(());
+                }
+            }
+        }
+        Err(KoraError::Unauthorized)
+    }
 
     fn load_invoice(env: &Env, id: u64) -> Result<Invoice, KoraError> {
         env.storage()
@@ -620,7 +701,7 @@ mod tests {
             &sme, &debtor_hash, &1_000_000_000i128,
             &Symbol::new(&env, "USDC"), &due_date, &ipfs_cid, &10u32,
         );
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::EmptyString);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::EmptyBytes);
     }
 
     #[test]
