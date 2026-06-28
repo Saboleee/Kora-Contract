@@ -62,6 +62,10 @@ pub enum DataKey {
     MigrationVersion,
     /// Pending upgrade proposal: (wasm_hash, proposed_at_timestamp).
     UpgradeProposal,
+    /// Instance key: authorized marketplace contract address
+    Marketplace,
+    /// Instance key: authorized financing pool contract address
+    FinancingPool,
 }
 
 
@@ -117,6 +121,21 @@ impl InvoiceNftContract {
         // if current_version < 2 { ... migrate to v2 ... }
         // if current_version < 3 { ... migrate to v3 ... }
 
+        Ok(())
+    }
+
+    /// Set the authorized marketplace and financing pool contract addresses.
+    /// Must be called by admin after deployment to enable status transitions.
+    pub fn set_authorized_callers(
+        env: Env,
+        admin: Address,
+        marketplace: Address,
+        financing_pool: Address,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::Marketplace, &marketplace);
+        env.storage().instance().set(&DataKey::FinancingPool, &financing_pool);
         Ok(())
     }
 
@@ -182,6 +201,7 @@ impl InvoiceNftContract {
     /// **Security:** Requires auth from the caller. Validates that the invoice is in `Created` status.
     pub fn set_listed(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
         caller.require_auth();
+        Self::require_authorized_caller(&env, &caller, &[DataKey::Marketplace])?;
         Self::require_not_paused(&env)?;
         let _guard = ReentrancyGuard::new(&env)?;
         let mut invoice = Self::load_invoice(&env, invoice_id)?;
@@ -208,6 +228,7 @@ impl InvoiceNftContract {
     /// **Security:** Requires auth from the caller. Validates that the invoice is in `Listed` status.
     pub fn set_funded(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
         caller.require_auth();
+        Self::require_authorized_caller(&env, &caller, &[DataKey::FinancingPool])?;
         Self::require_not_paused(&env)?;
         let _guard = ReentrancyGuard::new(&env)?;
         let mut invoice = Self::load_invoice(&env, invoice_id)?;
@@ -234,6 +255,7 @@ impl InvoiceNftContract {
     /// **Security:** Requires auth from the caller. Validates that the invoice is in `Funded` status.
     pub fn set_repaid(env: Env, caller: Address, invoice_id: u64) -> Result<(), KoraError> {
         caller.require_auth();
+        Self::require_authorized_caller(&env, &caller, &[DataKey::FinancingPool])?;
         Self::require_not_paused(&env)?;
         let mut invoice = Self::load_invoice(&env, invoice_id)?;
         if invoice.status != InvoiceStatus::Funded {
@@ -347,6 +369,17 @@ impl InvoiceNftContract {
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
+
+    fn require_authorized_caller(env: &Env, caller: &Address, allowed: &[DataKey]) -> Result<(), KoraError> {
+        for key in allowed {
+            if let Some(addr) = env.storage().instance().get::<DataKey, Address>(key) {
+                if &addr == caller {
+                    return Ok(());
+                }
+            }
+        }
+        Err(KoraError::Unauthorized)
+    }
 
     fn load_invoice(env: &Env, id: u64) -> Result<Invoice, KoraError> {
         env.storage()

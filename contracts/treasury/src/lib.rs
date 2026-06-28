@@ -203,6 +203,14 @@ impl TreasuryContract {
         token::Client::new(&env, &token).balance(&env.current_contract_address())
     }
 
+    /// Returns the total fees collected for a given token (informational ledger).
+    pub fn get_collected(env: Env, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Collected(token))
+            .unwrap_or(0)
+    }
+
     pub fn get_admin(env: Env) -> Result<Address, KoraError> {
         env.storage()
             .persistent()

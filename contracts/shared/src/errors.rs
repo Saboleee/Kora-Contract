@@ -30,6 +30,10 @@ pub enum KoraError {
     InsufficientFunds = 24,
     ExceedsFundingTarget = 25,
     AlreadyFullyFunded = 26,
+    ListingFullyFunded = 27,
+    FundingNotExpired = 28,
+    RefundAlreadyClaimed = 29,
+    NoContribution = 95,
 
     // Pool
     PoolNotFound = 30,
