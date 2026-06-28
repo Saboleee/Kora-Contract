@@ -53,6 +53,7 @@ pub enum KoraError {
     SMENotRegistered = 50,
     DebtorNotRegistered = 51,
     RiskScoreOutOfRange = 52,
+    ComplianceNotAttested = 53,
 
     // General
     ArithmeticOverflow = 90,

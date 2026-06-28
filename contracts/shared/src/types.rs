@@ -151,6 +151,7 @@ pub struct SmeProfile {
     pub total_invoices: u32,
     pub defaults: u32,
     pub registered_at: u64,
+    pub compliance_attested: bool,
 }
 
 /// Action types that can be proposed for multisig execution

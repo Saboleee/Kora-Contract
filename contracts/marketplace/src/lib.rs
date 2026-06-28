@@ -47,6 +47,7 @@ pub struct MarketplaceConfig {
     pub financing_pool: Address,
     pub treasury: Address,
     pub access_control: Address,
+    pub risk_registry: Address,
     pub fee_bps: u32,
 }
 
@@ -65,6 +66,7 @@ impl MarketplaceContract {
         financing_pool: Address,
         treasury: Address,
         access_control: Address,
+        risk_registry: Address,
         fee_bps: u32,
     ) -> Result<(), KoraError> {
         if env.storage().instance().has(&DataKey::Config) {
@@ -77,13 +79,13 @@ impl MarketplaceContract {
         env.storage().instance().set(&DataKey::Treasury, &treasury);
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
         env.storage().instance().set(&DataKey::AccessControl, &access_control);
-        require_valid_fee_bps(fee_bps)?;
         let config = MarketplaceConfig {
             admin,
             invoice_nft,
             financing_pool,
             treasury,
             access_control,
+            risk_registry,
             fee_bps,
         };
         env.storage().instance().set(&DataKey::Config, &config);
@@ -215,6 +217,7 @@ impl MarketplaceContract {
         }
 
         Self::require_whitelisted_token(&env, &token)?;
+        Self::require_compliance_attested(&env, &seller)?;
 
         if env
             .storage()
@@ -547,6 +550,7 @@ impl MarketplaceContract {
             .instance()
             .get(&DataKey::FeeBps)
             .ok_or(KoraError::NotInitialized)?;
+        let risk_registry: Address = Address::generate(env);
 
         let config = MarketplaceConfig {
             admin,
@@ -554,6 +558,7 @@ impl MarketplaceContract {
             financing_pool,
             treasury,
             access_control,
+            risk_registry,
             fee_bps,
         };
         env.storage().instance().set(&DataKey::Config, &config);
@@ -621,6 +626,7 @@ mod tests {
         seller: Address,
         treasury: Address,
         pool: Address,
+        registry: Address,
         mp: MarketplaceContractClient<'static>,
         nft: InvoiceNftContractClient<'static>,
     }
@@ -654,10 +660,16 @@ mod tests {
         let oracle = Address::generate(&env);
         pool_client.initialize(&admin, &nft_id, &treasury, &ac2, &200u32, &oracle);
 
+        let registry_id = env.register_contract(None, kora_risk_registry::RiskRegistryContract);
+        let registry = registry_id.clone();
+        let registry_client = kora_risk_registry::RiskRegistryContractClient::new(&env, &registry_id);
+        let staking_token = Address::generate(&env);
+        registry_client.initialize(&admin, &nft_id, &staking_token, &1_000_000i128, &5_000u32);
+
         let mp_ac = Address::generate(&env);
         let mp_id = env.register_contract(None, MarketplaceContract);
         let mp = MarketplaceContractClient::new(&env, &mp_id);
-        mp.initialize(&admin, &nft_id, &pool_id, &treasury, &mp_ac, &50u32);
+        mp.initialize(&admin, &nft_id, &pool_id, &treasury, &mp_ac, &registry, &50u32);
 
         // Register marketplace and pool as authorized callers on the NFT contract (#209)
         nft.set_authorized_callers(&admin, &mp_id, &pool_id);
@@ -667,7 +679,7 @@ mod tests {
 
         let seller = Address::generate(&env);
 
-        TestEnv { env, admin, token, seller, treasury, pool: pool_id, mp, nft }
+        TestEnv { env, admin, token, seller, treasury, pool: pool_id, registry, mp, nft }
     }
 
     /// Mint an invoice in the NFT contract and return its id.
@@ -716,6 +728,7 @@ mod tests {
             &Address::generate(&t.env),
             &Address::generate(&t.env),
             &Address::generate(&t.env),
+            &Address::generate(&t.env),
             &50u32,
         );
         assert_eq!(result.unwrap_err().unwrap(), KoraError::AlreadyInitialized);
@@ -728,6 +741,7 @@ mod tests {
         let mp_id = env.register_contract(None, MarketplaceContract);
         let mp = MarketplaceContractClient::new(&env, &mp_id);
         let result = mp.try_initialize(
+            &Address::generate(&env),
             &Address::generate(&env),
             &Address::generate(&env),
             &Address::generate(&env),
@@ -751,6 +765,7 @@ mod tests {
                 &Address::generate(&env),
                 &Address::generate(&env),
                 &Address::generate(&env),
+                &Address::generate(&env),
                 &0u32,
             )
             .is_ok());
@@ -764,6 +779,7 @@ mod tests {
         let mp = MarketplaceContractClient::new(&env, &mp_id);
         assert!(mp
             .try_initialize(
+                &Address::generate(&env),
                 &Address::generate(&env),
                 &Address::generate(&env),
                 &Address::generate(&env),
@@ -983,6 +999,69 @@ mod tests {
         let result =
             t.mp.try_list_invoice(&t.seller, &1u64, &-1i128, &10_000i128, &t.token, &deadline);
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
+    }
+
+    #[test]
+    fn test_list_invoice_unattested_sme_rejected() {
+        let t = deploy();
+        let verifier = Address::generate(&t.env);
+        let registry_client = kora_risk_registry::RiskRegistryContractClient::new(&t.env, &t.registry);
+        registry_client.add_verifier(&t.admin, &verifier);
+
+        let unattested_seller = Address::generate(&t.env);
+        registry_client.register_sme(&verifier, &unattested_seller, &50u32, &false);
+
+        let id = mint_invoice(&t);
+        let deadline = t.env.ledger().timestamp() + 86_400;
+        let result = t.mp.try_list_invoice(
+            &unattested_seller,
+            &1u64,
+            &9_500_000_000i128,
+            &10_000_000_000i128,
+            &t.token,
+            &deadline,
+        );
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::ComplianceNotAttested);
+    }
+
+    #[test]
+    fn test_list_invoice_attested_sme_succeeds() {
+        let t = deploy();
+        let verifier = Address::generate(&t.env);
+        let registry_client = kora_risk_registry::RiskRegistryContractClient::new(&t.env, &t.registry);
+        registry_client.add_verifier(&t.admin, &verifier);
+
+        let attested_seller = Address::generate(&t.env);
+        registry_client.register_sme(&verifier, &attested_seller, &50u32, &true);
+
+        let deadline = t.env.ledger().timestamp() + 86_400;
+        let nft_id = {
+            use soroban_sdk::{Bytes, String, Symbol};
+            let debtor_hash = Bytes::from_slice(&t.env, &[0xABu8; 32]);
+            let ipfs_cid = String::from_str(
+                &t.env,
+                "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            );
+            let due_date = t.env.ledger().timestamp() + 86_400 * 60;
+            t.nft.mint_invoice(
+                &attested_seller,
+                &debtor_hash,
+                &10_000_000_000i128,
+                &Symbol::new(&t.env, "USDC"),
+                &due_date,
+                &ipfs_cid,
+                &30u32,
+            )
+        };
+
+        assert!(t.mp.try_list_invoice(
+            &attested_seller,
+            &nft_id,
+            &9_500_000_000i128,
+            &10_000_000_000i128,
+            &t.token,
+            &deadline,
+        ).is_ok());
     }
 
     // ── get_listing ───────────────────────────────────────────────────────────
