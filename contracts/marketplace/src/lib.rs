@@ -1247,6 +1247,39 @@ mod tests {
         assert_eq!(listing.funded_amount, 1_000_000_000i128);
     }
 
+    #[test]
+    fn test_cancel_listing_after_partial_funding_exposes_fund_loss_risk() {
+        // BUG EXPOSURE: When a listing is cancelled after receiving partial funding,
+        // the investor's net contribution remains locked in financing_pool with no
+        // refund path. claim_refund requires deadline expiry; cancel_listing has no
+        // refund logic. This is the gap that B9 (reclaim mechanism) must address.
+        let t = deploy();
+        let id = list_one(&t);
+        let investor = Address::generate(&t.env);
+        let partial_amount = 2_000_000_000i128;
+
+        // Investor funds the listing partially
+        t.mp.fund_invoice(&investor, &id, &partial_amount);
+        let listing = t.mp.get_listing(&id).unwrap();
+        assert_eq!(listing.funded_amount, partial_amount);
+        assert!(listing.is_active);
+
+        // Seller cancels the partially-funded listing
+        assert!(t.mp.try_cancel_listing(&t.seller, &id).is_ok());
+        let cancelled_listing = t.mp.get_listing(&id).unwrap();
+        assert!(!cancelled_listing.is_active);
+
+        // BROKEN: Investor cannot claim refund because claim_refund requires
+        // the deadline to pass (line 352 of lib.rs). Cancellation before deadline
+        // with partial funding leaves investor funds stranded.
+        // Expected: refund should be claimable after cancel, or cancel should
+        // refund automatically (scope of B9).
+        let result = t.mp.try_claim_refund(&investor, &id);
+        // This currently fails with FundingNotExpired because deadline hasn't passed
+        // even though the listing was cancelled and funds are stuck.
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::FundingNotExpired);
+    }
+
     // ── fee arithmetic edge cases ─────────────────────────────────────────────
 
     #[test]
