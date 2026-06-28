@@ -162,6 +162,8 @@ Tests must pass with `cargo clippy -- -D warnings` clean.
 
 Report security issues privately to: **security@kora.finance** (or the maintainer contact listed in the repository).
 
+A log of past internal audit findings and their resolutions is maintained in [AUDIT_LOG.md](AUDIT_LOG.md).
+
 Include:
 - A description of the vulnerability
 - Steps to reproduce
