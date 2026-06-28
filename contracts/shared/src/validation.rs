@@ -87,6 +87,30 @@ pub fn require_non_empty_bytes(b: &Bytes) -> Result<(), KoraError> {
     Ok(())
 }
 
+/// Reject strings whose length exceeds `max_bytes`.
+#[inline]
+pub fn require_max_length_string(s: &String, max_bytes: u32) -> Result<(), KoraError> {
+    if s.len() > max_bytes {
+        return Err(KoraError::FieldTooLong);
+    }
+    Ok(())
+}
+
+/// Reject byte slices whose length exceeds `max_bytes`.
+#[inline]
+pub fn require_max_length_bytes(b: &Bytes, max_bytes: u32) -> Result<(), KoraError> {
+    if b.len() > max_bytes {
+        return Err(KoraError::FieldTooLong);
+    }
+    Ok(())
+}
+
+/// Maximum allowed byte length for an IPFS CID stored on-chain.
+pub const MAX_IPFS_CID_LEN: u32 = 128;
+
+/// Maximum allowed byte length for a debtor hash stored on-chain.
+pub const MAX_DEBTOR_HASH_LEN: u32 = 64;
+
 // ── Safe arithmetic ───────────────────────────────────────────────────────────
 
 /// Compute `amount * bps / 10_000` with overflow protection.
@@ -475,6 +499,34 @@ mod tests {
     #[test]
     fn test_bps_of_normalized_negative_rejected() {
         assert!(bps_of_normalized(-1_000, 50, 6).is_err());
+    }
+
+    #[test]
+    fn test_require_max_length_string_at_max_ok() {
+        let env = Env::default();
+        let s = SorobanString::from_str(&env, "a".repeat(128 as usize).as_str());
+        assert!(require_max_length_string(&s, 128).is_ok());
+    }
+
+    #[test]
+    fn test_require_max_length_string_exceeds_max_fails() {
+        let env = Env::default();
+        let s = SorobanString::from_str(&env, "a".repeat(129 as usize).as_str());
+        assert!(require_max_length_string(&s, 128).is_err());
+    }
+
+    #[test]
+    fn test_require_max_length_bytes_at_max_ok() {
+        let env = Env::default();
+        let b = Bytes::from_slice(&env, &[0u8; 64]);
+        assert!(require_max_length_bytes(&b, 64).is_ok());
+    }
+
+    #[test]
+    fn test_require_max_length_bytes_exceeds_max_fails() {
+        let env = Env::default();
+        let b = Bytes::from_slice(&env, &[0u8; 65]);
+        assert!(require_max_length_bytes(&b, 64).is_err());
     }
 }
 

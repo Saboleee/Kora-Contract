@@ -60,6 +60,8 @@ pub enum KoraError {
     NotInitialized = 96,
     // Distinct error for empty bytes (semantically different from EmptyString)
     EmptyBytes = 97,
+    // Field value exceeds the allowed maximum length
+    FieldTooLong = 95,
     // Reentrancy guard triggered
     Reentrancy = 98,
     // Upgrade
