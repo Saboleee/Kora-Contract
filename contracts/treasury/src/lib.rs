@@ -663,4 +663,17 @@ mod tests {
         // Returns 50 bps as the hard-coded fallback before initialization.
         assert_eq!(client.get_fee_bps(), 50);
     }
+
+    #[test]
+    fn test_get_balance_with_non_existent_token() {
+        // Test behavior when calling get_balance with an arbitrary unregistered address
+        // (not a valid token contract)
+        let (env, _admin, client) = setup();
+        let invalid_token = Address::generate(&env);
+
+        // get_balance should return 0 for a non-existent token
+        // (Soroban token::Client.balance() returns 0 if the account has no balance)
+        let balance = client.get_balance(&invalid_token);
+        assert_eq!(balance, 0i128, "Balance of non-existent token should be 0");
+    }
 }
