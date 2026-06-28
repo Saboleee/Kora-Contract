@@ -4,7 +4,7 @@ use kora_shared::{
     errors::KoraError,
     events,
     reentrancy::ReentrancyGuard,
-    validation::{require_valid_fee_bps, UPGRADE_TIMELOCK_DELAY},
+    validation::{require_valid_fee_bps, require_within_max_amount, UPGRADE_TIMELOCK_DELAY},
 };
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env};
 
@@ -132,6 +132,7 @@ impl TreasuryContract {
         if amount <= 0 {
             return Err(KoraError::InvalidAmount);
         }
+        require_within_max_amount(amount)?;
         Self::require_whitelisted_token(&env, &token)?;
 
         // Acquire reentrancy guard — released automatically when _guard drops
