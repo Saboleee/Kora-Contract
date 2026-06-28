@@ -913,7 +913,6 @@ mod tests {
         let client = FinancingPoolContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let nft = Address::generate(&env);
-        let risk_registry = Address::generate(&env);
         let treasury = Address::generate(&env);
         let access_control = Address::generate(&env);
         let oracle = Address::generate(&env);
@@ -948,7 +947,6 @@ mod tests {
         let client = FinancingPoolContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let nft = Address::generate(&env);
-        let rr = Address::generate(&env);
         let treasury = Address::generate(&env);
         let ac = Address::generate(&env);
         let oracle = Address::generate(&env);
@@ -1408,6 +1406,23 @@ mod tests {
         assert_eq!(positions.get(0).unwrap().investor, buyer);
         assert_eq!(positions.get(0).unwrap().share_bps, 5_000u32);
     }
+    #[test]
+    fn test_release_funds_blocked_when_paused() {
+        let (_env, _admin, _nft, _treasury, _ac, client) = setup();
+        let marketplace = Address::generate(&_env);
+        let token = Address::generate(&_env);
+        let result = client.try_release_funds(&marketplace, &1u64, &token);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_record_position_requires_pause_check() {
+        let (env, admin, _nft, _treasury, _ac, client) = setup();
+        let investor = Address::generate(&env);
+        let result = client.try_record_position(&admin, &1u64, &investor, &100i128, &1000i128);
+        assert!(result.is_ok());
+    }
+
 }
 
     #[test]

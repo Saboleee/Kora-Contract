@@ -187,6 +187,8 @@ SME repays the invoice. If fully repaid, distributes yield to all investors and 
 
 **Late penalty model:** On the first repayment call where `ledger.timestamp > invoice.due_date`, a one-time flat penalty of `bps_of(face_value, late_penalty_bps)` is added to `total_owed`. Subsequent repayments (partial or full) are tracked against `total_owed` so the penalty is never double-counted. Uses the same bps conventions as marketplace `fee_bps`.
 
+**Yield distribution precision:** When `is_closed && should_close`, yield is distributed proportionally to each investor based on their `share_bps`. Due to integer division in basis point calculations, rounding loss is bounded to **≤ position count × 1 stroop**. For up to 50 positions, drift is ≤ 50 stroops (negligible relative to typical invoice amounts). See [PERFORMANCE.md](PERFORMANCE.md) for detailed bounds.
+
 | Param | Type | Description |
 |-------|------|-------------|
 | `payer` | `Address` | Must sign. |
