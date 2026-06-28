@@ -37,6 +37,12 @@ impl RiskTier {
 }
 
 /// Core invoice NFT data stored on-chain
+///
+/// Schema version: 2 (see docs/MIGRATIONS.md for upgrade history)
+///
+/// Version history:
+///   v1 — original fields through `repaid_at`
+///   v2 — added `notes: Option<String>` for optional free-text memo (migration in invoice_nft::migrate)
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct Invoice {
@@ -54,6 +60,9 @@ pub struct Invoice {
     pub created_at: u64,
     pub funded_at: Option<u64>,
     pub repaid_at: Option<u64>,
+    /// Optional free-text memo attached at minting time. Added in schema v2.
+    /// Pre-existing records will have this field set to None by invoice_nft::migrate.
+    pub notes: Option<String>,
 }
 
 /// A marketplace listing for an invoice
