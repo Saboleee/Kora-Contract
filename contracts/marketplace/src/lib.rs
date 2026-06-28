@@ -6,7 +6,7 @@ use kora_shared::{
     errors::KoraError,
     events,
     reentrancy::ReentrancyGuard,
-    types::Listing,
+    types::{Listing, RiskTier},
     validation::{bps_of_normalized, require_non_zero_amount, require_valid_fee_bps, safe_add, safe_sub, UPGRADE_TIMELOCK_DELAY},
 };
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env};
@@ -29,6 +29,12 @@ pub enum DataKey {
     Listing(u64),
     WhitelistedToken(Address),
     UpgradeProposal,
+    /// Per-risk-tier fee override: TierFeeBps(ordinal) where AAA=0, AA=1, A=2, B=3, C=4 (#210)
+    TierFeeBps(u32),
+    /// Per-investor net contribution for refunds
+    Contribution(u64, Address),
+    /// Refund claimed flag
+    RefundClaimed(u64, Address),
 }
 
 // ── Config struct ─────────────────────────────────────────────────────────────
@@ -60,7 +66,6 @@ impl MarketplaceContract {
         treasury: Address,
         access_control: Address,
         fee_bps: u32,
-        access_control: Address,
     ) -> Result<(), KoraError> {
         if env.storage().instance().has(&DataKey::Config) {
             return Err(KoraError::AlreadyInitialized);
@@ -105,9 +110,44 @@ impl MarketplaceContract {
         Ok(Self::load_config(&env)?.fee_bps)
     }
 
+    /// Set a per-risk-tier fee override. Admin only. (#210)
+    pub fn set_tier_fee_bps(
+        env: Env,
+        admin: Address,
+        tier: RiskTier,
+        fee_bps: u32,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        let config = Self::load_config(&env)?;
+        if config.admin != admin {
+            return Err(KoraError::NotAdmin);
+        }
+        require_valid_fee_bps(fee_bps)?;
+        env.storage().instance().set(&DataKey::TierFeeBps(Self::tier_ordinal(&tier)), &fee_bps);
+        Ok(())
+    }
+
+    /// Get the fee for a specific risk tier (falls back to flat fee if no override). (#210)
+    pub fn get_tier_fee_bps(env: Env, tier: RiskTier) -> Result<u32, KoraError> {
+        let ordinal = Self::tier_ordinal(&tier);
+        Ok(env.storage().instance()
+            .get(&DataKey::TierFeeBps(ordinal))
+            .unwrap_or_else(|| Self::load_config(&env).map(|c| c.fee_bps).unwrap_or(50)))
+    }
+
     /// Returns the full config struct.
     pub fn get_config(env: Env) -> Result<MarketplaceConfig, KoraError> {
         Self::load_config(&env)
+    }
+
+    /// Returns the admin address.
+    pub fn get_admin(env: Env) -> Result<Address, KoraError> {
+        Ok(Self::load_config(&env)?.admin)
+    }
+
+    /// Update the marketplace fee. Admin only. Alias for set_fee_bps used by tests.
+    pub fn update_fee_bps(env: Env, admin: Address, fee_bps: u32) -> Result<(), KoraError> {
+        Self::set_fee_bps(env, admin, fee_bps)
     }
 
     /// Whitelist a stablecoin token. Admin only.
@@ -121,7 +161,7 @@ impl MarketplaceContract {
             .persistent()
             .set(&DataKey::WhitelistedToken(token.clone()), &true);
         Self::bump_persistent(&env, &DataKey::WhitelistedToken(token.clone()));
-        events::token_whitelisted(&env, &token);
+        events::token_whitelisted(&env, &admin, &token);
         Ok(())
     }
 
@@ -165,6 +205,8 @@ impl MarketplaceContract {
 
         require_non_zero_amount(asking_price)?;
         require_non_zero_amount(face_value)?;
+        require_within_max_amount(asking_price)?;
+        require_within_max_amount(face_value)?;
         kora_shared::validation::require_future_timestamp(&env, funding_deadline)?;
 
         // asking_price must be strictly less than face_value (discount must exist)
@@ -219,6 +261,7 @@ impl MarketplaceContract {
         Self::require_not_paused(&env)?;
 
         require_non_zero_amount(amount)?;
+        require_within_max_amount(amount)?;
 
         let mut listing: Listing = env
             .storage()
@@ -243,7 +286,14 @@ impl MarketplaceContract {
         let token_client = token::Client::new(&env, &listing.token);
         let token_decimals = token_client.decimals();
 
-        let fee = bps_of_normalized(amount, config.fee_bps, token_decimals)?;
+        // Fetch the invoice's risk tier and apply tier-specific fee (#210)
+        let nft_client = kora_invoice_nft::InvoiceNftContractClient::new(&env, &config.invoice_nft);
+        let invoice = nft_client.get_invoice(&invoice_id)?;
+        let effective_fee_bps: u32 = env.storage().instance()
+            .get(&DataKey::TierFeeBps(Self::tier_ordinal(&invoice.risk_tier)))
+            .unwrap_or(config.fee_bps);
+
+        let fee = bps_of_normalized(amount, effective_fee_bps, token_decimals)?;
         let net = amount
             .checked_sub(fee)
             .ok_or(KoraError::ArithmeticOverflow)?;
@@ -251,6 +301,9 @@ impl MarketplaceContract {
         // Transfer fee to treasury (if non-zero)
         if fee > 0 {
             token_client.transfer(&investor, &config.treasury, &fee);
+            // Record the collected fee in treasury's on-chain accounting (#208)
+            let treasury_client = kora_treasury::TreasuryContractClient::new(&env, &config.treasury);
+            treasury_client.collect_fee(&listing.token, &fee);
         }
         // Transfer net contribution to financing pool
         if net > 0 {
@@ -282,7 +335,7 @@ impl MarketplaceContract {
 
         events::invoice_funded(&env, invoice_id, &investor, amount);
         if fee > 0 {
-            events::fee_collected(&env, invoice_id, fee, &listing.token);
+            events::fee_collected(&env, &investor, invoice_id, fee, &listing.token);
         }
 
         if fully_funded {
@@ -398,24 +451,18 @@ impl MarketplaceContract {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    fn require_not_paused(env: &Env) -> Result<(), KoraError> {
-        if let Some(ac_contract) = env
+    fn require_whitelisted_token(env: &Env, token: &Address) -> Result<(), KoraError> {
+        let ok: bool = env
             .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::AccessControl)
-        {
-            let ac = kora_access_control::AccessControlContractClient::new(env, &ac_contract);
-            if ac.is_paused() {
-                return Err(KoraError::ProtocolPaused);
-            }
+            .persistent()
+            .get(&DataKey::WhitelistedToken(token.clone()))
+            .unwrap_or(false);
+        if !ok {
+            return Err(KoraError::TokenNotWhitelisted);
         }
         Ok(())
     }
 
-    fn require_whitelisted_token(env: &Env, token: &Address) -> Result<(), KoraError> {
-        let ok: bool = env
-            .storage()
-    /// Returns whether a token is whitelisted.
     pub fn is_token_whitelisted(env: Env, token: Address) -> bool {
         env.storage()
             .persistent()
@@ -534,6 +581,22 @@ impl MarketplaceContract {
             PERSISTENT_TTL_BUMP,
         );
     }
+
+    fn bump_persistent(env: &Env, key: &DataKey) {
+        env.storage().persistent().extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_BUMP);
+    }
+
+    /// Map RiskTier to a stable u32 ordinal for storage keying. (#210)
+    #[inline]
+    fn tier_ordinal(tier: &RiskTier) -> u32 {
+        match tier {
+            RiskTier::AAA => 0,
+            RiskTier::AA  => 1,
+            RiskTier::A   => 2,
+            RiskTier::B   => 3,
+            RiskTier::C   => 4,
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -579,9 +642,6 @@ mod tests {
 
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
-        let access_control = Address::generate(&env);
-        client.initialize(&admin, &nft, &pool, &treasury, &50u32, &access_control);
-        (env, admin, nft, pool, treasury, client)
 
         let nft_id = env.register_contract(None, InvoiceNftContract);
         let nft = InvoiceNftContractClient::new(&env, &nft_id);
@@ -598,6 +658,9 @@ mod tests {
         let mp_id = env.register_contract(None, MarketplaceContract);
         let mp = MarketplaceContractClient::new(&env, &mp_id);
         mp.initialize(&admin, &nft_id, &pool_id, &treasury, &mp_ac, &50u32);
+
+        // Register marketplace and pool as authorized callers on the NFT contract (#209)
+        nft.set_authorized_callers(&admin, &mp_id, &pool_id);
 
         let token = Address::generate(&env);
         mp.whitelist_token(&admin, &token);
@@ -1206,6 +1269,39 @@ mod tests {
         assert!(!listing.is_active);
         // funded_amount is preserved for record-keeping
         assert_eq!(listing.funded_amount, 1_000_000_000i128);
+    }
+
+    #[test]
+    fn test_cancel_listing_after_partial_funding_exposes_fund_loss_risk() {
+        // BUG EXPOSURE: When a listing is cancelled after receiving partial funding,
+        // the investor's net contribution remains locked in financing_pool with no
+        // refund path. claim_refund requires deadline expiry; cancel_listing has no
+        // refund logic. This is the gap that B9 (reclaim mechanism) must address.
+        let t = deploy();
+        let id = list_one(&t);
+        let investor = Address::generate(&t.env);
+        let partial_amount = 2_000_000_000i128;
+
+        // Investor funds the listing partially
+        t.mp.fund_invoice(&investor, &id, &partial_amount);
+        let listing = t.mp.get_listing(&id).unwrap();
+        assert_eq!(listing.funded_amount, partial_amount);
+        assert!(listing.is_active);
+
+        // Seller cancels the partially-funded listing
+        assert!(t.mp.try_cancel_listing(&t.seller, &id).is_ok());
+        let cancelled_listing = t.mp.get_listing(&id).unwrap();
+        assert!(!cancelled_listing.is_active);
+
+        // BROKEN: Investor cannot claim refund because claim_refund requires
+        // the deadline to pass (line 352 of lib.rs). Cancellation before deadline
+        // with partial funding leaves investor funds stranded.
+        // Expected: refund should be claimable after cancel, or cancel should
+        // refund automatically (scope of B9).
+        let result = t.mp.try_claim_refund(&investor, &id);
+        // This currently fails with FundingNotExpired because deadline hasn't passed
+        // even though the listing was cancelled and funds are stuck.
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::FundingNotExpired);
     }
 
     // ── fee arithmetic edge cases ─────────────────────────────────────────────
